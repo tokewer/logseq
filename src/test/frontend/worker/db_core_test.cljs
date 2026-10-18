@@ -1,11 +1,13 @@
 (ns frontend.worker.db-core-test
-  (:require [cljs.test :refer [async deftest is]]
+  (:require ["path" :as node-path]
+            [cljs.test :refer [async deftest is]]
             [clojure.string :as string]
             [datascript.core :as d]
             [datascript.impl.entity :as de]
             [datascript.storage :as storage]
             [frontend.common.thread-api :as thread-api]
             [frontend.db.query-dsl :as query-dsl]
+            [frontend.test.node-helper :as node-helper]
             [frontend.worker-common.util :as worker-util]
             [frontend.worker.db-core :as db-core]
             [frontend.worker.db-listener :as db-listener]
@@ -18,6 +20,7 @@
             [frontend.worker.handler.search :as search-handler]
             [frontend.worker.pipeline :as worker-pipeline]
             [frontend.worker.platform :as platform]
+            [frontend.worker.platform.node :as platform-node]
             [frontend.worker.query-dsl :as worker-query-dsl]
             [frontend.worker.search :as search]
             [frontend.worker.shared-service :as shared-service]
@@ -25,9 +28,12 @@
             [frontend.worker.sync :as db-sync]
             [frontend.worker.sync.client-op :as client-op]
             [frontend.worker.sync.download :as sync-download]
+            [frontend.worker.ui-request :as ui-request]
             [frontend.worker.undo-redo :as worker-undo-redo]
             [goog.object :as gobj]
             [logseq.common.config :as common-config]
+            [logseq.common.log :as log]
+            [logseq.common.util.date-time :as date-time-util]
             [logseq.db :as ldb]
             [logseq.db.common.initial-data :as common-initial-data]
             [logseq.db.common.order :as db-order]
@@ -66,7 +72,7 @@
           :thread-api/build-publishing-html :thread-api/reset-db
           :thread-api/get-file-content :thread-api/get-all-properties :thread-api/get-date-scheduled-or-deadlines
           :thread-api/unsafe-unlink-db :thread-api/close-db
-          :thread-api/db-sync-close-db :thread-api/db-sync-invalidate-search-db :thread-api/db-sync-recreate-lock
+          :thread-api/db-sync-close-db :thread-api/db-sync-invalidate-search-db
           :thread-api/db-sync-rehydrate-large-titles :thread-api/db-sync-import-prepare :thread-api/db-sync-import-rows-chunk
           :thread-api/db-sync-import-finalize :thread-api/release-access-handles :thread-api/db-exists
           :thread-api/export-db-binary :thread-api/import-file-graph
@@ -77,7 +83,7 @@
           :thread-api/markdown-mirror-set-enabled :thread-api/markdown-mirror-flush :thread-api/markdown-mirror-regenerate
           :thread-api/export-get-debug-datoms :thread-api/export-get-all-page->content :thread-api/validate-db
           :thread-api/recompute-checksum-diagnostics :thread-api/export-edn :thread-api/import-edn
-          :thread-api/get-fsrs-due-card-block-ids :thread-api/get-view-data
+          :thread-api/get-fsrs-due-card-block-ids :thread-api/get-fsrs-card-block-ids :thread-api/get-view-data
           :thread-api/get-class-objects :thread-api/validate-block-tag
           :thread-api/convert-tag-to-page
           :thread-api/convert-page-to-tag
@@ -443,24 +449,16 @@
            (swap! listener-snapshots conj
                   {:repo listener-repo
                    :entities entities
-                   :missing-revisions
-                   (into #{}
-                         (keep (fn [entity]
-                                 (when-not (nat-int? (:block/tx-id entity))
-                                   (:block/uuid entity))))
-                         entities)})))]
+                   :blocks (mapv #(block-handler/canonical-block @conn %) entities)})))]
       (p/let [_ ((get-thread-api :thread-api/create-or-open-db) repo opts)
-              conn (worker-state/get-datascript-conn repo)
-              {:keys [entities missing-revisions]} (first @listener-snapshots)]
+              {:keys [entities blocks]} (first @listener-snapshots)]
         (is (= 1 (count @listener-snapshots)))
         (is (= repo (:repo (first @listener-snapshots))))
         (is (seq entities))
-        (is (empty? missing-revisions)
-            "Every UUID entity must have a local revision before the renderer listener is installed.")
-        (when (empty? missing-revisions)
-          (doseq [entity entities]
-            (is (= (:block/uuid entity)
-                   (:block/uuid (block-handler/canonical-block @conn entity))))))
+        (doseq [[entity block] (map vector entities blocks)]
+          (is (= (:block/uuid entity) (:block/uuid block)))
+          (is (= (get entity :block/tx-id 0) (:block/tx-id block)))
+          (is (nat-int? (:block/tx-id block))))
         (is (empty? @broadcasts)
             "Bootstrap transactions must not publish incremental renderer deltas.")
         (db-core/close-db! repo)))))
@@ -1223,6 +1221,115 @@
                 (is false (str "unexpected error: " error))))
      (p/finally done))))
 
+(deftest search-build-blocks-indice-in-worker-moves-version-four-index-to-rowid-keys-test
+  (async done
+    (->
+     (restoring-worker-state
+      (fn []
+        (let [build-index! (get @thread-api/*thread-apis :thread-api/search-build-blocks-indice-in-worker)
+              build-ids @#'search-handler/*search-index-build-ids
+              page (str (random-uuid))
+              blocks (mapv (fn [i] {:id (str (random-uuid)) :title (str "block " i) :page page}) (range 450))
+              rows (fn [db sql] (js->clj (.exec db #js {:sql sql :rowMode "array"})))
+              path (node-path/join (node-helper/create-tmp-dir "search-db") "search.sqlite")]
+          (platform/set-platform! (build-test-platform {:runtime :node}))
+          (p/let [db (#'platform-node/open-sqlite-db nil {:path path})]
+            ;; a version 4 index: FTS rows found by id, rowids drifted by updates
+            (.exec db "CREATE TABLE blocks (id TEXT NOT NULL PRIMARY KEY, title TEXT NOT NULL, page TEXT)")
+            (.exec db "CREATE VIRTUAL TABLE blocks_fts USING fts5(id, title, page, tokenize=\"trigram\")")
+            (.exec db "CREATE TRIGGER blocks_ai AFTER INSERT ON blocks BEGIN
+                         INSERT INTO blocks_fts (id, title, page) VALUES (new.id, new.title, new.page);
+                       END;")
+            (.exec db "CREATE TRIGGER blocks_au AFTER UPDATE ON blocks BEGIN
+                         DELETE from blocks_fts where id = old.id;
+                         INSERT INTO blocks_fts (id, title, page) VALUES (new.id, new.title, new.page);
+                       END;")
+            (search/upsert-blocks! db (clj->js blocks))
+            (search/upsert-blocks! db (clj->js (map #(assoc % :title "edited") (take 10 blocks))))
+            (.exec db "PRAGMA user_version = 4")
+            (reset! worker-state/*sqlite-conns {test-repo {:search db}})
+            ;; no datascript conn: the move reads the search db only
+            (p/let [result (build-index! test-repo false)
+                    _ (<wait-for-progress! build-ids #(nil? (get % test-repo)) 1000)]
+              (is (= 4 result) "the old index serves search while it moves, so the graph is ready at once")
+              (is (= [[search-handler/search-db-version]] (rows db "PRAGMA user_version")))
+              (is (= [[450]] (rows db "SELECT count(*) FROM blocks_fts")))
+              (is (= [] (rows db "SELECT b.id FROM blocks b LEFT JOIN blocks_fts f ON f.rowid = b.rowid
+                                  WHERE f.id IS NOT b.id OR f.title IS NOT b.title")))
+              (is (= [[10]] (rows db "SELECT count(*) FROM blocks_fts WHERE title MATCH 'edited'")))
+              (.close db))))))
+     (p/catch (fn [error]
+                (is false (str "unexpected error: " error))))
+     (p/finally done))))
+
+(deftest search-rowid-migration-truncated-before-start-test
+  (async done
+    (->
+     (restoring-worker-state
+      (fn []
+        (let [build-index! (get @thread-api/*thread-apis :thread-api/search-build-blocks-indice-in-worker)
+              truncate! (get @thread-api/*thread-apis :thread-api/search-truncate-tables)
+              build-ids @#'search-handler/*search-index-build-ids
+              block-id (str (random-uuid))
+              page-id (str (random-uuid))
+              rows (fn [db sql] (js->clj (.exec db #js {:sql sql :rowMode "array"})))
+              path (node-path/join (node-helper/create-tmp-dir "search-db") "search.sqlite")]
+          (platform/set-platform! (build-test-platform {:runtime :node}))
+          (p/let [db (#'platform-node/open-sqlite-db nil {:path path})]
+            (search/create-tables-and-triggers! db)
+            (.exec db "PRAGMA user_version = 4")
+            (reset! worker-state/*sqlite-conns {test-repo {:search db}})
+            (-> (p/let [result (build-index! test-repo false)
+                        _ (truncate! test-repo)
+                        _ (<wait-for-progress! build-ids #(nil? (get % test-repo)) 1000)]
+                  (is (= 4 result))
+                  (is (nil? (get @build-ids test-repo)))
+                  (is (= [[0]] (rows db "PRAGMA user_version")))
+                  (is (= [] (rows db "SELECT name FROM sqlite_master WHERE name GLOB 'blocks_fts_next*'")))
+                  (is (= [["blocks_ad"] ["blocks_ai"] ["blocks_au"]]
+                         (rows db "SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name")))
+                  (search/upsert-blocks! db #js [#js {:id block-id :title "after truncate" :page page-id}])
+                  (is (= [[block-id]] (rows db "SELECT id FROM blocks_fts WHERE title MATCH 'truncate'"))))
+                (p/finally (fn [] (.close db))))))))
+     (p/catch (fn [error]
+                (is false (str "unexpected error: " error))))
+     (p/finally done))))
+
+(deftest search-rowid-migration-superseded-before-start-test
+  (async done
+    (->
+     (restoring-worker-state
+      (fn []
+        (let [build-ids @#'search-handler/*search-index-build-ids
+              block-id (str (random-uuid))
+              page-id (str (random-uuid))
+              rows (fn [db sql] (js->clj (.exec db #js {:sql sql :rowMode "array"})))
+              path (node-path/join (node-helper/create-tmp-dir "search-db") "search.sqlite")]
+          (platform/set-platform! (build-test-platform {:runtime :node}))
+          (p/let [db (#'platform-node/open-sqlite-db nil {:path path})]
+            (search/create-tables-and-triggers! db)
+            (.exec db "PRAGMA user_version = 4")
+            (reset! worker-state/*sqlite-conns {test-repo {:search db}})
+            (swap! build-ids assoc test-repo "old-build")
+            (let [migration (#'search-handler/<migrate-fts-to-rowid! test-repo db "old-build")]
+              (swap! build-ids assoc test-repo "new-build")
+              (search/start-fts-rowid-migration! db)
+              (search/upsert-blocks! db #js [#js {:id block-id :title "new build" :page page-id}])
+              (-> migration
+                  (p/then (fn [_] (is false "the superseded migration must stop")))
+                  (p/catch (fn [error]
+                             (is (= :search/stale-index-build (:type (ex-data error))))))
+                  (p/then (fn [_]
+                            (is (= "new-build" (get @build-ids test-repo)))
+                            (is (= [[block-id]] (rows db "SELECT id FROM blocks_fts_next")))
+                            (is (= [[4]] (rows db "PRAGMA user_version")))))
+                  (p/finally (fn []
+                               (swap! build-ids dissoc test-repo)
+                               (.close db)))))))))
+     (p/catch (fn [error]
+                (is false (str "unexpected error: " error))))
+     (p/finally done))))
+
 (deftest vector-embedding-title-truncates-long-text-test
   (let [vector-embedding-title #'search-handler/vector-embedding-title
         long-title (apply str (repeat 6000 "x"))]
@@ -1397,7 +1504,35 @@
        (is (= "/graph/search/vector"
               (vector-index-path test-repo pool)))))))
 
-;; ---- checkpoint-db! tests ----
+;; ---- sqlite WAL / checkpoint tests ----
+
+(deftest enable-sqlite-wal-mode-sets-exclusive-wal-and-synchronous-normal
+  (let [enable-sqlite-wal-mode! #'db-core/enable-sqlite-wal-mode!
+        sql-calls (atom [])
+        db #js {:exec (fn [sql]
+                        (swap! sql-calls conj sql)
+                        #js [])}]
+    (enable-sqlite-wal-mode! db)
+    (is (= ["PRAGMA locking_mode=exclusive"
+            "PRAGMA journal_mode=WAL"
+            "PRAGMA synchronous=NORMAL"]
+           @sql-calls))))
+
+(deftest enable-sqlite-wal-mode-sqlite-reports-wal-and-synchronous-normal
+  (let [Database (js/require "better-sqlite3")
+        node-path (js/require "path")
+        dir (node-helper/create-tmp-dir "wal-pragma")
+        db (new Database (.join node-path dir "graph.sqlite"))
+        pragma (fn [name]
+                 (aget (.get (.prepare db (str "PRAGMA " name))) name))]
+    (try
+      (#'db-core/enable-sqlite-wal-mode! db)
+      (is (= "exclusive" (pragma "locking_mode")))
+      (is (= "wal" (pragma "journal_mode")))
+      (is (= 1 (pragma "synchronous"))
+          "sqlite NORMAL is 1; FULL (the WAL default) is 2")
+      (finally
+        (.close db)))))
 
 (deftest checkpoint-db-executes-wal-checkpoint
   (let [checkpoint-db! #'db-core/checkpoint-db!
@@ -1591,7 +1726,13 @@
    (fn []
      (let [conn (d/create-conn db-schema/schema)
            block-uuid #uuid "11111111-2222-3333-4444-555555555555"]
-       (d/transact! conn [{:db/ident :logseq.class/Page
+       (d/transact! conn [{:db/ident :logseq.property/hide?
+                           :db/index true}
+                          {:db/ident :logseq.property/deleted-at
+                           :db/index true}
+                          {:db/ident :logseq.property/built-in?
+                           :db/index true}
+                          {:db/ident :logseq.class/Page
                            :block/title "Page"}
                           {:block/uuid block-uuid
                            :block/title "Tagged page"
@@ -1604,6 +1745,7 @@
                  :block/uuid block-uuid
                  :block/title "Tagged page"
                  :block/raw-title "Tagged page"
+                 :block.temp/property-keys [:block/tags]
                  :block/tags [{:db/id class-id
                                :db/ident :logseq.class/Page
                                :block/title "Page"
@@ -1903,6 +2045,33 @@
          (is (= ["Jan 2nd, 2024"] (mapv :block/title result)))
          (is (= ["Jan 2nd, 2024"] (mapv :block/raw-title result))))))))
 
+(deftest get-latest-journals-bounded-scan
+  (restoring-worker-state
+   (fn []
+     (let [conn (d/create-conn task-spent-time-schema)
+           journal-count 50]
+       (d/transact! conn (sqlite-create-graph/build-db-initial-data "{}"))
+       (d/transact! conn (mapv (fn [i]
+                                 {:block/uuid (random-uuid)
+                                  :block/title (str "journal " i)
+                                  :block/name (str "journal " i)
+                                  :block/journal-day (+ 20240101 i)
+                                  :block/tags :logseq.class/Journal})
+                               (range journal-count)))
+       (let [scanned (volatile! 0)
+             wrap-scan (fn [f]
+                         (fn [db index c & cs]
+                           (let [s (apply f db index c cs)]
+                             (if (= :block/journal-day c)
+                               (map (fn [d] (vswap! scanned inc) d) s)
+                               s))))
+             realized (with-redefs [d/datoms (wrap-scan d/datoms)
+                                    d/rseek-datoms (wrap-scan d/rseek-datoms)]
+                        (doall (take 1 (ldb/get-latest-journals @conn))))]
+         (is (= 1 (count realized)))
+         ;; bounded request: realizes O(requested) datoms, not O(total journals)
+         (is (< @scanned journal-count)))))))
+
 ;; ---- q / datoms / pull thread-api tests ----
 
 (deftest q-executes-datascript-query
@@ -1996,7 +2165,23 @@
        (is (= ["current worker page"]
               (resolve-inputs! test-repo [":current-page"]
                                {:current-page page-uuid
-                                :today-title "Today"})))))))
+                                :today-title "Today"})))
+       (let [broken-refs-matcher "\\([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\)"]
+         (is (= [broken-refs-matcher]
+                (resolve-inputs! test-repo [broken-refs-matcher] {}))
+             "Regex query inputs that start with an escaped paren stay strings.")
+         (doseq [input ["target-page" "two words" "foo.*"]]
+           (is (= [input] (resolve-inputs! test-repo [input] {}))
+               "Raw string query inputs retain their complete text."))
+         (is (= [tag-uuid]
+                (resolve-inputs! test-repo [(str "#uuid \"" tag-uuid "\"")] {}))
+             "Plugin EDN UUID inputs stay UUIDs.")
+         (is (= ["target-page"]
+                (resolve-inputs! test-repo ["\"target-page\""] {}))
+             "Quoted EDN string inputs are unquoted.")
+         (is (= [["a" "b" "c"]]
+                (resolve-inputs! test-repo ["[\"a\" \"b\" \"c\"]"] {}))
+             "EDN collection inputs stay collections."))))))
 
 (deftest query-dsl-worker-apis-run-against-worker-db
   (restoring-worker-state
@@ -2276,6 +2461,8 @@
              plain-results (remove #(= "Block 2" (:block/title %)) children)
              unrelated-result (some #(when (= "Block 3" (:block/title %)) %) children)]
          (is (= 165 (count children)))
+         (is (every? #(not (contains? % :block.temp/breadcrumb)) (cons block children))
+             "Ordinary tree metadata does not preload breadcrumbs.")
          (is (contains? block :block.temp/display-properties)
              "The journal root should carry full render data in its initial tree response.")
          (is (contains? block :block.temp/positioned-properties))
@@ -2562,60 +2749,413 @@
          (is (= [:user.property/a :user.property/b :logseq.property/icon :logseq.property/private]
                 (map :db/ident with-built-ins))))))))
 
+(defn- assert-terminal-import-result
+  [result]
+  (is (string? (:run-id result)))
+  (is (contains? #{:completed :completed-with-errors} (:status result)))
+  (is (true? (:persisted? result)))
+  (is (map? (:validation result)))
+  (is (nat-int? (:issue-count result)))
+  (is (nat-int? (:org-file-count result)))
+  (is (not (contains? result :files)))
+  (is (not (contains? result :import-state)))
+  (is (not (contains? result :staged-assets)))
+  (is (not (contains? result :ignored-properties))))
+
 (deftest import-file-graph-imports-documents-into-worker-conn
   (async done
-         (restoring-worker-state
-          (fn []
-            (let [import-file-graph! (get @thread-api/*thread-apis :thread-api/import-file-graph)
-                  conn (d/create-conn db-schema/schema)
-                  pipeline-before @ldb/*transact-pipeline-fn
-                  renderer-payloads (atom [])
-                  config-file {:path "logseq/config.edn"
-                               :file/content "{}"}
-                  files [config-file
-                         {:path "pages/Home.md"
-                          :file/content "- imported block"}]]
-              (is (fn? import-file-graph!))
-              (d/transact! conn (sqlite-create-graph/build-db-initial-data "{}"))
-              (reset! worker-state/*datascript-conns {test-repo conn})
-              (ldb/register-transact-pipeline-fn! worker-pipeline/transact-pipeline)
-              (p/with-redefs
-                [db-sync/update-local-sync-checksum! (fn [& _] nil)
-                 db-sync/handle-local-tx! (fn [& _] nil)
-                 shared-service/broadcast-to-clients!
-                 (fn [event payload]
-                   (when (= :sync-db-changes event)
-                     (swap! renderer-payloads conj payload)))]
-                (db-listener/listen-db-changes! test-repo conn
-                                                :handler-keys [:sync-db-to-main-thread])
-                (->
-                 (p/let [result (import-file-graph! test-repo config-file files {:user-options {}})
-                         page (some->> (d/q '[:find [?e ...]
-                                               :where [?e :block/name "home"]]
-                                             @conn)
-                                             first
-                                        (d/entity @conn))
-                         block (db-test/find-block-by-content @conn "imported block")
-                         published-block-uuids
-                         (into #{}
-                               (mapcat #(keys (get-in % [:delta :blocks])))
-                               @renderer-payloads)]
-                   (is (= #{"pages/Home.md" "logseq/config.edn"}
-                          (set (map :path (:files result)))))
-                   (is (= "Home" (:block/title page)))
-                   (is (= "imported block" (:block/title block)))
-                   (doseq [entity [page block]]
-                     (is (nat-int? (:block/tx-id entity)))
-                     (is (= (:block/uuid entity)
-                            (:block/uuid (block-handler/canonical-block @conn entity))))
-                     (is (contains? published-block-uuids (:block/uuid entity))
-                         "Live file imports must publish complete canonical replacements.")))
-                 (p/catch
-                  (fn [error]
-                    (is false (str error))))
-                 (p/finally (fn []
-                              (reset! ldb/*transact-pipeline-fn pipeline-before)
-                              (done))))))))))
+         (->
+          (restoring-worker-state
+           (fn []
+             (let [import-file-graph! (get @thread-api/*thread-apis :thread-api/import-file-graph)
+                   conn (d/create-conn db-schema/schema)
+                   pipeline-before @ldb/*transact-pipeline-fn
+                   renderer-payloads (atom [])
+                   ui-state (atom [])
+                   config-file {:path "logseq/config.edn"
+                                :file/content "{}"}
+                   files [config-file
+                          {:path "pages/Home.md"
+                           :file/content "- imported block"}]]
+               (is (fn? import-file-graph!))
+               (d/transact! conn (sqlite-create-graph/build-db-initial-data "{}"))
+               (reset! worker-state/*datascript-conns {test-repo conn})
+               (reset! worker-state/*main-thread
+                       (fn [qkw & args]
+                         (when (= qkw :thread-api/set-ui-state)
+                           (swap! ui-state conj (vec args)))
+                         (p/resolved nil)))
+               (ldb/register-transact-pipeline-fn! worker-pipeline/transact-pipeline)
+               (p/with-redefs
+                 [db-sync/update-local-sync-checksum! (fn [& _] nil)
+                  db-sync/handle-local-tx! (fn [& _] nil)
+                  shared-service/broadcast-to-clients!
+                  (fn [event payload]
+                    (when (= :sync-db-changes event)
+                      (swap! renderer-payloads conj payload)))]
+                 (db-listener/listen-db-changes! test-repo conn
+                                                 :handler-keys [:sync-db-to-main-thread])
+                 (->
+                  (p/let [result (import-file-graph! test-repo config-file files {:user-options {}})
+                          page (some->> (d/q '[:find [?e ...]
+                                                :where [?e :block/name "home"]]
+                                              @conn)
+                                              first
+                                         (d/entity @conn))
+                          block (db-test/find-block-by-content @conn "imported block")]
+                    (assert-terminal-import-result result)
+                    (is (= :completed (:status result)))
+                    (is (= 0 (:org-file-count result)))
+                    (is (= 0 (:ignored-properties-count result)))
+                    (is (= {:status :passed :error-count 0} (:validation result)))
+                    (is (= "Home" (:block/title page)))
+                    (is (= "imported block" (:block/title block)))
+                    (doseq [entity [page block]]
+                      (is (nat-int? (:block/tx-id entity)))
+                      (is (= (:block/uuid entity)
+                             (:block/uuid (block-handler/canonical-block @conn entity)))))
+                    (is (empty? @renderer-payloads)
+                        "File-graph import must not broadcast renderer deltas to clients."))
+                  (p/finally (fn []
+                               (reset! ldb/*transact-pipeline-fn pipeline-before))))))))
+          (p/catch
+           (fn [error]
+             (is false (str error))))
+          (p/finally done))))
+
+(deftest import-file-graph-reads-file-stat-from-path-string
+  (async done
+         (->
+          (restoring-worker-state
+           (fn []
+             (let [import-file-graph! (get @thread-api/*thread-apis :thread-api/import-file-graph)
+                   conn (d/create-conn db-schema/schema)
+                   pipeline-before @ldb/*transact-pipeline-fn
+                   stat-paths (atom [])
+                   created-at (js/Date. "2020-01-02T03:04:05.000Z")
+                   modified-at (js/Date. "2021-06-07T08:09:10.000Z")
+                   fake-fsp #js {:stat (fn [path]
+                                         (swap! stat-paths conj path)
+                                         (p/resolved #js {:birthtime created-at
+                                                          :mtime modified-at}))}
+                   config-file {:path "logseq/config.edn"
+                                :file/content "{}"}
+                   files [config-file
+                          {:path "pages/Home.md"
+                           :fs-path "/tmp/graph/pages/Home.md"
+                           :file/content "- timestamped"}]]
+               (d/transact! conn (sqlite-create-graph/build-db-initial-data "{}"))
+               (reset! worker-state/*datascript-conns {test-repo conn})
+               (reset! worker-state/*main-thread (fn [& _] (p/resolved nil)))
+               (platform/set-platform! (build-test-platform {:runtime :node}))
+               (ldb/register-transact-pipeline-fn! worker-pipeline/transact-pipeline)
+               (p/with-redefs
+                 [db-core/node-fs-promises (fn [] fake-fsp)
+                  db-sync/update-local-sync-checksum! (fn [& _] nil)
+                  db-sync/handle-local-tx! (fn [& _] nil)
+                  shared-service/broadcast-to-clients! (fn [& _] nil)]
+                 (->
+                  (p/let [_result (import-file-graph! test-repo config-file files {:user-options {}})
+                          page (ldb/get-page @conn "home")
+                          block (db-test/find-block-by-content @conn "timestamped")]
+                    (is (= ["/tmp/graph/pages/Home.md"] @stat-paths)
+                        "Exporter passes a filesystem path string to <get-file-stat.")
+                    (is (= (.getTime created-at) (:block/created-at page) (:block/created-at block)))
+                    (is (= (.getTime modified-at) (:block/updated-at page) (:block/updated-at block))))
+                  (p/finally (fn []
+                               (reset! ldb/*transact-pipeline-fn pipeline-before))))))))
+          (p/catch
+           (fn [error]
+             (is false (str error))))
+          (p/finally done))))
+
+(deftest import-file-graph-lazy-read-failure-is-ignored-not-empty-page
+  (async done
+         (->
+          (restoring-worker-state
+           (fn []
+             (let [import-file-graph! (get @thread-api/*thread-apis :thread-api/import-file-graph)
+                   conn (d/create-conn db-schema/schema)
+                   pipeline-before @ldb/*transact-pipeline-fn
+                   fake-fsp #js {:readFile (fn [_path _encoding]
+                                             (p/rejected (js/Error. "ENOENT")))
+                                 :stat (fn [_path]
+                                         (p/rejected (js/Error. "ENOENT")))}
+                   config-file {:path "logseq/config.edn"
+                                :file/content "{}"}
+                   files [config-file
+                          {:path "pages/Missing.md"
+                           :fs-path "/tmp/graph/pages/Missing.md"}]]
+               (d/transact! conn (sqlite-create-graph/build-db-initial-data "{}"))
+               (reset! worker-state/*datascript-conns {test-repo conn})
+               (reset! worker-state/*main-thread (fn [& _] (p/resolved nil)))
+               (platform/set-platform! (build-test-platform {:runtime :node}))
+               (ldb/register-transact-pipeline-fn! worker-pipeline/transact-pipeline)
+               (p/with-redefs
+                 [db-core/node-fs-promises (fn [] fake-fsp)
+                  db-sync/update-local-sync-checksum! (fn [& _] nil)
+                  db-sync/handle-local-tx! (fn [& _] nil)
+                  shared-service/broadcast-to-clients! (fn [& _] nil)]
+                 (->
+                  (p/let [result (import-file-graph! test-repo config-file files {:user-options {}})]
+                    (is (nil? (ldb/get-page @conn "missing"))
+                        "A missing lazy file is not imported as an empty page.")
+                    (is (pos? (:ignored-files-count result))
+                        "Read failure is recorded as an ignored file.")
+                    (is (= :completed-with-errors (:status result))))
+                  (p/finally (fn []
+                               (reset! ldb/*transact-pipeline-fn pipeline-before))))))))
+          (p/catch
+           (fn [error]
+             (is false (str error))))
+          (p/finally done))))
+
+(defn- imported-ref-uuids
+  [entity]
+  (set (map :block/uuid (:block/refs entity))))
+
+(deftest import-file-graph-stores-page-refs-and-progress
+  (async done
+         (->
+          (restoring-worker-state
+           (fn []
+             (let [import-file-graph! (get @thread-api/*thread-apis :thread-api/import-file-graph)
+                   get-block-refs! (get @thread-api/*thread-apis :thread-api/get-block-refs)
+                   conn (d/create-conn db-schema/schema)
+                   pipeline-before @ldb/*transact-pipeline-fn
+                   renderer-payloads (atom [])
+                   ui-state (atom [])
+                   config-file {:path "logseq/config.edn"
+                                :file/content "{}"}
+                   files [config-file
+                          {:path "pages/source.md"
+                           :file/content "- see [[Target]]"}
+                          {:path "pages/Target.md"
+                           :file/content "- target"}]]
+               (d/transact! conn (sqlite-create-graph/build-db-initial-data "{}"))
+               (reset! worker-state/*datascript-conns {test-repo conn})
+               (reset! worker-state/*main-thread
+                       (fn [qkw & args]
+                         (when (= qkw :thread-api/set-ui-state)
+                           (swap! ui-state conj (vec args)))
+                         (p/resolved nil)))
+               (ldb/register-transact-pipeline-fn! worker-pipeline/transact-pipeline)
+               (p/with-redefs
+                 [db-sync/update-local-sync-checksum! (fn [& _] nil)
+                  db-sync/handle-local-tx! (fn [& _] nil)
+                  shared-service/broadcast-to-clients!
+                  (fn [event payload]
+                    (when (= :sync-db-changes event)
+                      (swap! renderer-payloads conj payload)))]
+                 (db-listener/listen-db-changes! test-repo conn
+                                                 :handler-keys [:sync-db-to-main-thread])
+                 (->
+                  (p/let [result (import-file-graph! test-repo config-file files {:user-options {}})
+                          current-pages (->> @ui-state
+                                             (filter #(= [:graph/importing-state :current-page] (first %)))
+                                             (map second)
+                                             set)
+                          last-label (->> @ui-state
+                                          (filter #(= [:graph/importing-state :label] (first %)))
+                                          last
+                                          second)
+                          target (db-test/find-page-by-title @conn "Target")
+                          block (or (db-test/find-block-by-content @conn #"see ")
+                                    (db-test/find-block-by-content @conn (re-pattern (str (:block/uuid target)))))
+                          canonical-block (when block (block-handler/canonical-block @conn block))
+                          canonical-target (when target (block-handler/canonical-block @conn target))
+                          linked (when target (get-block-refs! test-repo (:db/id target)))]
+                    (is (some? target) "Target page is imported.")
+                    (is (some? block) "Referring block is imported.")
+                    (is (contains? (imported-ref-uuids block) (:block/uuid target))
+                        "Imported block refs are stored on the worker conn.")
+                    (is (contains? (imported-ref-uuids canonical-block) (:block/uuid target))
+                        "UI canonical blocks include the same page refs.")
+                    (is (pos? (:block.temp/refs-count canonical-target))
+                        "UI linked-reference counts are present on the referenced page.")
+                    (is (contains? (set (map :block/uuid linked))
+                                   (:block/uuid block))
+                        "Linked-references API returns the referring block.")
+                    (is (empty? @renderer-payloads)
+                        "File-graph import must not broadcast renderer deltas to clients.")
+                    (assert-terminal-import-result result)
+                    (is (contains? current-pages "logseq/config.edn")
+                        "Import progress shows the config file being read.")
+                    (is (contains? current-pages "pages/source.md")
+                        "Import progress shows the current markdown file.")
+                    (is (contains? current-pages "pages/Target.md")
+                        "Import progress shows each imported markdown file.")
+                    (is (some #{:import/finishing}
+                              (->> @ui-state
+                                   (filter #(= [:graph/importing-state :label] (first %)))
+                                   (map second)))
+                        "After files are written, progress shows finishing work.")
+                    (is (= :import/validating-graph last-label)
+                        "After files are written, progress shows graph validation.")
+                    (is (= 2 (->> @ui-state
+                                  (filter #(= [:graph/importing-state :total] (first %)))
+                                  last
+                                  second))
+                        "Progress total is the number of markdown files.")
+                    (is (seq (filter #(= [:graph/importing-state :current-idx] (first %))
+                                     @ui-state))
+                        "Progress current-idx updates during import."))
+                  (p/finally (fn []
+                               (reset! ldb/*transact-pipeline-fn pipeline-before))))))))
+          (p/catch
+           (fn [error]
+             (is false (str error))))
+          (p/finally done))))
+
+(deftest import-file-graph-reports-progress-via-node-post-message
+  (async done
+         (->
+          (restoring-worker-state
+           (fn []
+             (let [import-file-graph! (get @thread-api/*thread-apis :thread-api/import-file-graph)
+                   conn (d/create-conn db-schema/schema)
+                   pipeline-before @ldb/*transact-pipeline-fn
+                   posted (atom [])
+                   main-thread-calls (atom [])
+                   config-file {:path "logseq/config.edn"
+                                :file/content "{}"}
+                   files [config-file
+                          {:path "pages/Home.md"
+                           :file/content "- imported on node"}]]
+               (d/transact! conn (sqlite-create-graph/build-db-initial-data "{}"))
+               (reset! worker-state/*datascript-conns {test-repo conn})
+               (platform/set-platform!
+                (build-test-platform
+                 {:runtime :node
+                  :post-message! (fn [type payload]
+                                   (swap! posted conj [type payload]))}))
+               (reset! worker-state/*main-thread
+                       (fn [qkw & _args]
+                         (swap! main-thread-calls conj qkw)
+                         (p/rejected (ex-info "main-thread is not available in db-worker-node"
+                                              {:method qkw}))))
+               (ldb/register-transact-pipeline-fn! worker-pipeline/transact-pipeline)
+               (p/with-redefs
+                 [db-sync/update-local-sync-checksum! (fn [& _] nil)
+                  db-sync/handle-local-tx! (fn [& _] nil)
+                  shared-service/broadcast-to-clients! (fn [& _] nil)]
+                 (db-listener/listen-db-changes! test-repo conn
+                                                 :handler-keys [:sync-db-to-main-thread])
+                 (->
+                  (p/let [result (import-file-graph! test-repo config-file files {:user-options {}})
+                          ui-state (keep (fn [[type payload]]
+                                           (when (= type :thread-api/set-ui-state)
+                                             payload))
+                                         @posted)
+                          current-pages (->> ui-state
+                                             (filter #(= [:graph/importing-state :current-page] (first %)))
+                                             (map second)
+                                             set)
+                          last-label (->> ui-state
+                                          (filter #(= [:graph/importing-state :label] (first %)))
+                                          last
+                                          second)]
+                    (is (map? result)
+                        "Desktop import returns the terminal worker reply.")
+                    (assert-terminal-import-result result)
+                    (is (empty? @main-thread-calls)
+                        "Desktop db-worker-node must not use the main-thread stub for import progress.")
+                    (is (contains? current-pages "pages/Home.md")
+                        "Desktop import progress is posted over the node event channel.")
+                    (is (= :import/validating-graph last-label)
+                        "Desktop import progress reaches graph validation."))
+                  (p/finally (fn []
+                               (reset! ldb/*transact-pipeline-fn pipeline-before))))))))
+          (p/catch
+           (fn [error]
+             (is false (str error))))
+          (p/finally done))))
+
+(deftest import-file-graph-streams-files-via-ui-request
+  (async done
+         (->
+          (restoring-worker-state
+           (fn []
+             (let [import-file-graph! (get @thread-api/*thread-apis :thread-api/import-file-graph)
+                   conn (d/create-conn db-schema/schema)
+                   pipeline-before @ldb/*transact-pipeline-fn
+                   in-flight (atom 0)
+                   max-in-flight (atom 0)
+                   requested (atom [])
+                   contents {"logseq/config.edn" "{}"
+                             "pages/Home.md" "- imported home"
+                             "pages/Projects.md" "- imported projects"}
+                   config-file {:path "logseq/config.edn"
+                                :fs-path "/tmp/graph/logseq/config.edn"}
+                   files [{:path "logseq/config.edn"
+                           :fs-path "/tmp/graph/logseq/config.edn"}
+                          {:path "pages/Home.md"
+                           :fs-path "/tmp/graph/pages/Home.md"}
+                          {:path "pages/Projects.md"
+                           :fs-path "/tmp/graph/pages/Projects.md"}]]
+               (d/transact! conn (sqlite-create-graph/build-db-initial-data "{}"))
+               (reset! worker-state/*datascript-conns {test-repo conn})
+               (reset! worker-state/*main-thread (fn [& _] (p/resolved nil)))
+               (ldb/register-transact-pipeline-fn! worker-pipeline/transact-pipeline)
+               (p/with-redefs
+                 [db-sync/update-local-sync-checksum! (fn [& _] nil)
+                  db-sync/handle-local-tx! (fn [& _] nil)
+                  shared-service/broadcast-to-clients! (fn [& _] nil)
+                  ui-request/<request
+                  (fn [action payload _opts]
+                    (is (= :read-import-file action))
+                    (swap! requested conj (:path payload))
+                    (swap! in-flight inc)
+                    (swap! max-in-flight max @in-flight)
+                    (p/let [_ (p/delay 0)]
+                      (swap! in-flight dec)
+                      {:path (:path payload)
+                       :file/content (get contents (:path payload))}))]
+                 (->
+                  (p/let [result (import-file-graph! test-repo config-file files {:user-options {}})
+                          home (ldb/get-page @conn "home")
+                          projects (ldb/get-page @conn "projects")
+                          home-block (db-test/find-block-by-content @conn "imported home")
+                          project-block (db-test/find-block-by-content @conn "imported projects")]
+                    (assert-terminal-import-result result)
+                    (is (= "Home" (:block/title home)))
+                    (is (= "Projects" (:block/title projects)))
+                    (is (= "imported home" (:block/title home-block)))
+                    (is (= "imported projects" (:block/title project-block)))
+                    (is (= 1 @max-in-flight)
+                        "Browser db-worker streams one file at a time via UI request and must not read Node fs.")
+                    (is (= #{"logseq/config.edn" "pages/Home.md" "pages/Projects.md"}
+                           (set @requested))))
+                  (p/finally (fn []
+                               (reset! ldb/*transact-pipeline-fn pipeline-before))))))))
+          (p/catch
+           (fn [error]
+             (is false (str error))))
+          (p/finally done))))
+
+(deftest transact-failed-logs-tx-count-not-tx-data-test
+  (let [conn (db-test/create-conn)
+        tx-data [{:db/id -1
+                  :block/uuid (random-uuid)
+                  :block/title "block-1"}]
+        logs (atom [])
+        original-error (js/Error. "store failed")]
+    (with-redefs [log/error (fn [& args]
+                              (swap! logs conj args))
+                  d/transact! (fn [& _] (throw original-error))]
+      (try
+        (ldb/transact! conn tx-data {:skip-validate-db? true})
+        (is false "expected transact! to throw")
+        (catch :default e
+          (is (identical? original-error e)
+              "Original transaction error is rethrown, not a printer overflow."))))
+    (let [payload (some (fn [args]
+                          (some #(when (and (map? %) (:tx-count %)) %) args))
+                        @logs)]
+      (is (some? payload))
+      (is (pos? (:tx-count payload)))
+      (is (not (contains? payload :tx-data)))
+      (is (string/includes? (:error payload) "store failed")))))
 
 (deftest get-date-scheduled-or-deadlines-filters-sorts-and-groups-worker-results
   (restoring-worker-state
@@ -2671,6 +3211,40 @@
                 (set (map :block/title page-a))))
          (is (= ["other page"]
                 (mapv :block/title page-b))))))))
+
+(deftest get-date-scheduled-or-deadlines-uses-local-calendar-day-bounds
+  (restoring-worker-state
+   (fn []
+     (let [get-date-scheduled-or-deadlines! (get @thread-api/*thread-apis :thread-api/get-date-scheduled-or-deadlines)
+           conn (d/create-conn db-schema/schema)
+           page-id -1
+           today 20260928
+           [start end] (date-time-util/journal-day-local-range-ms today 7)
+           today-no-time (.getTime (js/Date. 2026 8 28 0 0 0 0))
+           yesterday-21 (.getTime (js/Date. 2026 8 27 21 0 0 0))
+           plus6-21 (.getTime (js/Date. 2026 9 4 21 0 0 0))]
+       (d/transact! conn (sqlite-create-graph/build-db-initial-data "{}"))
+       (d/transact! conn [{:db/id page-id
+                           :block/title "Tasks"
+                           :block/uuid #uuid "33333333-3333-3333-3333-333333333333"}
+                          {:block/title "today no-time"
+                           :block/page page-id
+                           :logseq.property/scheduled today-no-time
+                           :logseq.property/status :logseq.property/status.todo}
+                          {:block/title "yesterday 21:00"
+                           :block/page page-id
+                           :logseq.property/deadline yesterday-21
+                           :logseq.property/status :logseq.property/status.todo}
+                          {:block/title "+6d 21:00"
+                           :block/page page-id
+                           :logseq.property/scheduled plus6-21
+                           :logseq.property/status :logseq.property/status.todo}])
+       (reset! worker-state/*datascript-conns {test-repo conn})
+       (let [result (get-date-scheduled-or-deadlines! test-repo start end)
+             titles (->> result vals (apply concat) (map :block/title) set)]
+         (is (contains? titles "today no-time"))
+         (is (not (contains? titles "yesterday 21:00")))
+         (is (contains? titles "+6d 21:00")))))))
 
 (deftest get-property-node-selector-data-prepares-worker-owned-db-data-test
   (restoring-worker-state
@@ -2864,6 +3438,7 @@
        (d/transact! conn (sqlite-create-graph/build-db-initial-data "{}"))
        (d/transact! conn [{:db/id first-block-tempid
                            :block/title "Object"
+                           :block/name "object"
                            :block/uuid first-block-id
                            :block/tags :logseq.class/Page}
                           {:db/id second-block-tempid
@@ -3494,3 +4069,16 @@
          (is (string? (:error result)))
          (is (= page-class-id (:db/id (d/entity @dest-conn :logseq.class/Page)))
              "Invalid datom import should not replace the existing graph"))))))
+
+(deftest close-db-attempts-remaining-handles-on-failure
+  (restoring-worker-state
+   (fn []
+     (let [closed (atom [])
+           failing (fake-db {})
+           search-db (fake-db {:close-calls closed :close-label :search})
+           client-db (fake-db {:close-calls closed :close-label :client-ops})]
+       (set! (.-close failing) (fn [] (throw (js/Error. "close failed"))))
+       (reset! worker-state/*sqlite-conns
+               {test-repo {:db failing :search search-db :client-ops client-db}})
+       (is (thrown? js/Error (db-core/close-db! test-repo)))
+       (is (= [:search :client-ops] @closed))))))
