@@ -15,6 +15,7 @@
             [frontend.db.async :as db-async]
             [frontend.extensions.fsrs :as fsrs]
             [frontend.handler.assets :as assets-handler]
+            [frontend.handler.auto-save :as auto-save]
             [frontend.handler.code :as code-handler]
             [frontend.handler.comments :as comments-handler]
             [frontend.handler.common.page :as page-common-handler]
@@ -155,10 +156,12 @@
 (defevent! :graph/switch [[_ graph opts]]
   (let [t1 (t/now)]
     (p/do!
+     (auto-save/flush-save!)
+     (auto-save/cancel-auto-save!)
      (export/cancel-db-backup!)
      (state/clear-async-queries!)
      (graph-switch-on-persisted graph opts)
-     (export/backup-db-graph (state/get-current-repo))
+     (auto-save/flush-save! (state/get-current-repo))
      (let [t2 (t/now)]
        (log/info ::graph-switch-spent (- t2 t1))))))
 
@@ -286,8 +289,23 @@
   (fsrs/update-due-cards-count)
   nil)
 
+(defevent! :graph/data-changed [[_ repo]]
+  (when repo
+    (auto-save/schedule-auto-save! repo)))
+
 (defevent! :graph/save-db-to-disk [[_ _opts]]
-  (persist-db/export-current-graph! :succ-notification? true))
+  (if (util/electron?)
+    (persist-db/export-current-graph! :succ-notification? true)
+    (when-let [repo (state/get-current-repo)]
+      (-> (auto-save/flush-save! repo)
+          (p/then (fn [result]
+                    (case result
+                      true (notification/show! (t :export/backup-successful) :success)
+                      :graph-not-changed (notification/show! (t :export/no-updates-since-last-export) :success)
+                      nil)))
+          (p/catch (fn [err]
+                     (when-not (= "AbortError" (.-name err))
+                       (notification/show! (t :export/db-backup-error) :error))))))))
 
 (defevent! :graph/db-save-shortcut [[_]]
   (state/pub-event! [:graph/save-db-to-disk {:source :shortcut}]))

@@ -110,8 +110,10 @@
            (str "pages/" stem' ".md")))))))
 
 (defn- mirror-path
-  [repo relative-path]
-  (str (repo-mirror-dir repo) "/" relative-path))
+  [repo relative-path platform*]
+  (if (= :browser (get-in platform* [:env :runtime]))
+    (str repo "/" relative-path)
+    (str (repo-mirror-dir repo) "/" relative-path)))
 
 (defn- page-id-for-entity
   [db eid]
@@ -596,7 +598,7 @@
 
           :else
           (if-let [relative-path (page-relative-path db page opts)]
-            (let [path (mirror-path repo relative-path)
+            (let [path (mirror-path repo relative-path platform*)
                   content (render-page-content db page opts)]
               (<write-if-changed! platform* path content))
             (p/resolved (invalid-file-name-result repo page))))
@@ -619,8 +621,8 @@
     {:repo repo
      :page-id page-id
      :db db-after
-     :old-path (when old-relative-path (mirror-path repo old-relative-path))
-     :new-path (when new-relative-path (mirror-path repo new-relative-path))
+     :old-path (when old-relative-path (mirror-path repo old-relative-path (or (:platform opts) (platform/current))))
+     :new-path (when new-relative-path (mirror-path repo new-relative-path (or (:platform opts) (platform/current))))
      :delete? (deleted-page? after-page)}))
 
 (defn- merge-job

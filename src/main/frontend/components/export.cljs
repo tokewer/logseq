@@ -5,6 +5,7 @@
             [frontend.config :as config]
             [frontend.context.i18n :refer [interpolate-rich-text-node interpolate-sentence t]]
             [frontend.db.async :as db-async]
+            [frontend.handler.auto-save :as auto-save]
             [frontend.handler.block :as block-handler]
             [frontend.handler.db-based.export :as db-export-handler]
             [frontend.handler.export :as export]
@@ -80,14 +81,29 @@
                                                    [[:db/retractEntity :logseq.kv/graph-backup-folder]]
                                                    nil
                                                    nil)
+                          (auto-save/cancel-auto-save! repo)
+                          (export/cancel-db-backup!)
                           (reset! *backup-folder nil)))
              :size :sm}
             (ui/icon "x"))]
           (shui/button
            {:variant :default
             :on-click (fn []
-                        (p/let [[folder-name _handle] (export/choose-backup-folder repo)]
-                          (reset! *backup-folder folder-name)))}
+                        (-> (p/let [[folder-name _handle] (export/choose-backup-folder repo)]
+                              (when folder-name
+                                (reset! *backup-folder folder-name)
+                                (export/auto-db-backup! repo)
+                                (p/let [result (auto-save/flush-save! repo)]
+                                  (case result
+                                    true
+                                    (notification/show! (t :export/backup-successful) :success)
+                                    :graph-not-changed
+                                    (notification/show! (t :export/no-updates-since-last-export) :success)
+                                    nil))))
+                            (p/catch (fn [error]
+                                       (when-not (= "AbortError" (.-name error))
+                                         (js/console.error "Failed to set backup folder:" error)
+                                         (notification/show! (t :export/db-backup-error) :error))))))}
            (t :export.backup/set-folder-first)))
         [:div.opacity-50.text-sm
          (t :export.backup/hourly-note)]
@@ -97,7 +113,7 @@
            {:variant :default
             :on-click (fn []
                         (->
-                         (p/let [result (export/backup-db-graph repo)]
+                         (p/let [result (auto-save/flush-save! repo)]
                            (case result
                              true
                              (notification/show! (t :export/backup-successful) :success)
@@ -106,8 +122,9 @@
                              nil)
                            (export/auto-db-backup! repo))
                          (p/catch (fn [error]
-                                    (println "Failed to backup.")
-                                    (js/console.error error)))))}
+                                    (when-not (= "AbortError" (.-name error))
+                                      (println "Failed to backup.")
+                                      (js/console.error error))))))}
            (t :export.backup/backup-now)))]
        [:div
         [:span

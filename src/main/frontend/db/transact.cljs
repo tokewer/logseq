@@ -170,7 +170,10 @@
                     (state/<invoke-db-worker :thread-api/undo-redo-set-pending-editor-info
                                              repo
                                              (state/get-editor-info))
-                    (worker-transact repo tx-data tx-meta'))))))
+                    (p/let [res (worker-transact repo tx-data tx-meta')]
+                      (when util/web-platform?
+                        (state/pub-event! [:graph/data-changed repo]))
+                      res))))))
 
 (defn apply-outliner-ops
   [conn ops opts]
@@ -229,4 +232,6 @@
                  :ui-refresh ui-refresh-perf
                  :state-update-ms (- ui-updated-at worker-returned-at)
                  :total-to-next-frame-ms (- (now-ms) started-at)}))))
+          (when util/web-platform?
+            (state/pub-event! [:graph/data-changed request-repo]))
           result)))))

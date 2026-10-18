@@ -1,4 +1,7 @@
-{:paths ["src/main" "src/electron" "src/resources"]
+{:paths ["src/main" "src/electron" "src/resources"
+         "deps/common/src" "deps/common/resources" "deps/db/src" "deps/publishing/src"
+         "deps/shui/src" "deps/outliner/src" "deps/graph-parser/src"
+         "deps/db-sync/src"]
  :deps
  {org.clojure/clojure                   {:mvn/version "1.12.4"}
   org.clojure/clojurescript             {:mvn/version "1.12.134"}

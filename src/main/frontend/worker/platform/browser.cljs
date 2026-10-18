@@ -97,6 +97,81 @@
   [path text]
   (opfs/<write-text! path text))
 
+(def ^:private web-graph-handle-prefix "web-graph/")
+
+(defn- graph-handle-key
+  [repo]
+  (str web-graph-handle-prefix (js/encodeURIComponent repo)))
+
+(defn- legacy-graph-handle-key
+  [repo]
+  (try
+    (str web-graph-handle-prefix (js/btoa repo))
+    (catch :default _ nil)))
+
+(defn- graph-relative-path
+  [path]
+  (let [parts (string/split path #"/" 2)]
+    (if (= 2 (count parts))
+      (second parts)
+      path)))
+
+(defn- <graph-file-handle
+  [repo path create?]
+  (p/let [root (or (idb/get-item (graph-handle-key repo))
+                   (when-let [legacy-key (legacy-graph-handle-key repo)]
+                     (idb/get-item legacy-key)))
+          _ (when-not root
+              (throw (ex-info "Web Graph folder is not selected" {:repo repo})))
+          segments (-> (graph-relative-path path)
+                       (string/split #"/")
+                       (remove string/blank?))
+          file-name (last segments)
+          directories (butlast segments)
+          directory (p/loop [handle root
+                             remaining directories]
+                      (if-let [segment (first remaining)]
+                        (p/let [next-handle (.getDirectoryHandle handle segment #js {:create create?})]
+                          (p/recur next-handle (rest remaining)))
+                        handle))]
+    (.getFileHandle directory file-name #js {:create create?})))
+
+(defn- web-graph-read-text!
+  [path]
+  (let [repo (first (string/split path #"/" 2))]
+    (p/let [file-handle (<graph-file-handle repo path false)
+            file (.getFile file-handle)
+            text (.text file)]
+      text)))
+
+(defn- web-graph-write-text!
+  [path text]
+  (let [repo (first (string/split path #"/" 2))]
+    (p/let [file-handle (<graph-file-handle repo path true)
+            writable (.createWritable file-handle)
+            _ (.write writable text)]
+      (.close writable))))
+
+(defn- web-graph-delete-file!
+  [path]
+  (let [repo (first (string/split path #"/" 2))
+        relative-path (graph-relative-path path)]
+    (p/let [segments (string/split relative-path #"/")
+            file-name (last segments)
+            directories (butlast segments)
+            root (or (idb/get-item (graph-handle-key repo))
+                     (when-let [legacy-key (legacy-graph-handle-key repo)]
+                       (idb/get-item legacy-key)))
+            _ (when-not root
+                (throw (ex-info "Web Graph folder is not selected" {:repo repo})))
+            directory (p/loop [handle root
+                               remaining directories]
+                        (if-let [segment (first remaining)]
+                          (p/let [next-handle (.getDirectoryHandle handle segment)]
+                            (p/recur next-handle (rest remaining)))
+                          handle))]
+      (.removeEntry directory file-name))))
+
 (defn- browser-pfs
   []
   (or (some-> js/globalThis .-window .-pfs)
@@ -210,9 +285,9 @@
              :remove-vfs! remove-vfs!
              :read-text! read-text!
              :write-text! write-text!
-             :write-text-atomic! unsupported-mirror-storage!
-             :delete-file! unsupported-mirror-storage!
-             :mirror-read-text! unsupported-mirror-storage!
+             :write-text-atomic! web-graph-write-text!
+             :delete-file! web-graph-delete-file!
+             :mirror-read-text! web-graph-read-text!
              :asset-read-bytes! asset-read-bytes!
              :asset-write-bytes! asset-write-bytes!
              :asset-stat asset-stat

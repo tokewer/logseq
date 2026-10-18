@@ -588,7 +588,7 @@
        (when (state/feature-http-server-enabled?)
          (server/server-indicator (rfx/use-sub [:electron/server])))
 
-       (when (util/electron?)
+       (when (or (util/electron?) util/web-platform?)
          (back-and-forward))
 
        (when-not (mobile-util/native-platform?)

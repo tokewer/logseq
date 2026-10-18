@@ -671,6 +671,8 @@
  :export.backup/cancel "取消备份"
  :export.backup/enabled-desc "已为此知识库启用每小时备份，{1}。"
  :export.backup/folder "备份文件夹："
+ :export.backup/handle-not-found "备份文件夹已不可访问，请重新选择。"
+ :export.backup/permission-expired "备份文件夹访问权限已过期，请重新选择文件夹以恢复访问。"
  :export.backup/hourly-note "备份将每小时创建一次。"
  :export.backup/open-folder "打开此知识库的备份文件夹"
  :export.backup/schedule "定时备份"
@@ -1739,6 +1741,9 @@
  :settings.features/semantic-search "语义搜索"
  :settings.features/semantic-search-desc "在搜索结果中包含语义匹配。适用于 macOS Apple 芯片设备。"
  :settings.features/semantic-search-python3-missing "请安装 Python 3 以启用语义搜索。"
+ :settings.features/web-graph-folder "Web 图谱 Markdown 文件夹"
+ :settings.features/select-web-graph-folder "选择 Markdown 文件夹"
+ :settings.features/web-graph-folder-error "无法选择 Web 图谱 Markdown 文件夹：{1}"
 
  :settings.general/accent-color "高亮色"
  :settings.general/accent-color-alert "选择高亮色可能会影响你选择的自定义主题。"

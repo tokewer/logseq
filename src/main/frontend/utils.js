@@ -175,7 +175,9 @@ export const writeFile = async (fileHandle, contents) => {
 }
 
 export const nfsSupported = () => {
-  if ('chooseFileSystemEntries' in self) {
+  if ('showDirectoryPicker' in self) {
+    return 'showDirectoryPicker'
+  } else if ('chooseFileSystemEntries' in self) {
     return 'chooseFileSystemEntries'
   } else if ('showOpenFilePicker' in self) {
     return 'showOpenFilePicker'

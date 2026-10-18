@@ -387,6 +387,221 @@
                (is false (str error))))
             (p/finally cleanup!))))))
 
+(deftest choose-backup-folder-persists-folder-with-unicode-repo-test
+  (async done
+    (let [repo "logseq_db_便签记录"
+          handle #js {:name "Backups"}
+          idb-call (atom nil)
+          worker-call (atom nil)
+          original-open-directory browser-utils/openDirectory
+          original-idb-set-item! idb/set-item!
+          original-invoke-db-worker state/<invoke-db-worker
+          original-db-transact! db/transact!]
+      (set! browser-utils/openDirectory
+            (fn [_opts]
+              (p/resolved #js [handle])))
+      (set! idb/set-item!
+            (fn [key value]
+              (reset! idb-call [key value])
+              nil))
+      (set! state/<invoke-db-worker
+            (fn [& args]
+              (reset! worker-call args)
+              (p/resolved nil)))
+      (set! db/transact!
+            (fn [& _]
+              (throw (js/Error. "renderer DB should not persist graph backup folder"))))
+      (letfn [(cleanup! []
+                (set! browser-utils/openDirectory original-open-directory)
+                (set! idb/set-item! original-idb-set-item!)
+                (set! state/<invoke-db-worker original-invoke-db-worker)
+                (set! db/transact! original-db-transact!)
+                (done))]
+        (-> (export/choose-backup-folder repo)
+            (p/then
+             (fn [result]
+               (is (= ["Backups" handle] result))
+               (is (= [(str "handle/" (js/encodeURIComponent repo) "/Backups") handle]
+                      @idb-call))
+               (is (= [:thread-api/transact
+                       repo
+                       [{:db/ident :logseq.kv/graph-backup-folder
+                         :kv/value "Backups"}]
+                       nil
+                       nil]
+                      @worker-call))))
+            (p/catch
+             (fn [error]
+               (is false (str error))))
+            (p/finally cleanup!))))))
+
+(deftest web-backup-db-graph-archives-without-move-test
+  (async done
+    (let [repo "logseq_db_backup_test"
+          web-platform? util/web-platform?
+          archive-writes (atom [])
+          db-writes (atom [])
+          initial-bytes (js/Uint8Array. #js [1 2 3 4])
+          new-bytes (js/Uint8Array. #js [5 6 7 8])
+          existing-file #js {:name "db.sqlite"
+                             :size 4
+                             :arrayBuffer (fn [] (p/resolved (.-buffer initial-bytes)))}
+          backup-file-handle #js {:getFile (fn [] (p/resolved existing-file))
+                                  :createWritable (fn []
+                                                    (p/resolved
+                                                     #js {:write (fn [data]
+                                                                   (swap! db-writes conj data)
+                                                                   (p/resolved nil))
+                                                          :close (fn [] (p/resolved nil))}))}
+          archive-file-handle #js {:createWritable
+                                   (fn []
+                                     (p/resolved
+                                      #js {:write (fn [data]
+                                                    (swap! archive-writes conj data)
+                                                    (p/resolved nil))
+                                           :close (fn [] (p/resolved nil))}))}
+          backups-handle #js {:getFileHandle (fn [_name _opts] (p/resolved archive-file-handle))
+                              :removeEntry (fn [_name] (p/resolved nil))}
+          graph-dir-handle #js {:getDirectoryHandle
+                                (fn [name _opts]
+                                  (if (= name "backups")
+                                    (p/resolved backups-handle)
+                                    (throw (js/Error. (str "Unexpected dir: " name)))))
+                                :getFileHandle
+                                (fn [name _opts]
+                                  (if (= name "db.sqlite")
+                                    (p/resolved backup-file-handle)
+                                    (throw (js/Error. (str "Unexpected file: " name)))))}
+          root-handle #js {:name "MyBackups"
+                           :getDirectoryHandle (fn [_name _opts] (p/resolved graph-dir-handle))}
+          original-get-current-repo state/get-current-repo
+          original-invoke-db-worker state/<invoke-db-worker
+          original-idb-get-item idb/get-item
+          original-verify-permission browser-utils/verifyPermission
+          original-export-db persist-db/<export-db
+          original-get-files browser-utils/getFiles]
+      (set! util/web-platform? true)
+      (set! state/get-current-repo (constantly repo))
+      (set! browser-utils/verifyPermission (fn [_handle _rw] (p/resolved nil)))
+      (set! browser-utils/getFiles (fn [_handle _rec] (p/resolved #js [])))
+      (set! state/<invoke-db-worker
+            (fn [api repo' key]
+              (is (= :thread-api/get-key-value api))
+              (is (= repo repo'))
+              (is (= :logseq.kv/graph-backup-folder key))
+              (p/resolved "MyBackups")))
+      (set! idb/get-item
+            (fn [_key]
+              (p/resolved root-handle)))
+      (set! persist-db/<export-db
+            (fn [repo' opts]
+              (is (= repo repo'))
+              (is (= {:return-data? true} opts))
+              (p/resolved new-bytes)))
+      (letfn [(cleanup! []
+                (set! util/web-platform? web-platform?)
+                (set! state/get-current-repo original-get-current-repo)
+                (set! browser-utils/verifyPermission original-verify-permission)
+                (set! browser-utils/getFiles original-get-files)
+                (set! state/<invoke-db-worker original-invoke-db-worker)
+                (set! idb/get-item original-idb-get-item)
+                (set! persist-db/<export-db original-export-db)
+                (done))]
+        (-> (export/backup-db-graph repo)
+            (p/then
+             (fn [result]
+               (is (= true result))
+               (is (= 1 (count @archive-writes)))
+               (is (= existing-file (first @archive-writes)))
+               (is (= 1 (count @db-writes)))
+               (is (= new-bytes (first @db-writes)))))
+            (p/catch
+             (fn [error]
+               (is false (str error))))
+            (p/finally cleanup!))))))
+
+(deftest web-backup-db-graph-returns-not-changed-when-binary-identical-test
+  (async done
+    (let [repo "logseq_db_backup_unchanged"
+          web-platform? util/web-platform?
+          archive-writes (atom [])
+          db-writes (atom [])
+          same-bytes (js/Uint8Array. #js [10 20 30 40 50])
+          existing-file #js {:name "db.sqlite"
+                             :size 5
+                             :arrayBuffer (fn [] (p/resolved (.-buffer same-bytes)))}
+          backup-file-handle #js {:getFile (fn [] (p/resolved existing-file))
+                                  :createWritable (fn []
+                                                    (p/resolved
+                                                     #js {:write (fn [data]
+                                                                   (swap! db-writes conj data)
+                                                                   (p/resolved nil))
+                                                          :close (fn [] (p/resolved nil))}))}
+          archive-file-handle #js {:createWritable
+                                   (fn []
+                                     (p/resolved
+                                      #js {:write (fn [data]
+                                                    (swap! archive-writes conj data)
+                                                    (p/resolved nil))
+                                           :close (fn [] (p/resolved nil))}))}
+          backups-handle #js {:getFileHandle (fn [_name _opts] (p/resolved archive-file-handle))
+                              :removeEntry (fn [_name] (p/resolved nil))}
+          graph-dir-handle #js {:getDirectoryHandle
+                                (fn [name _opts]
+                                  (if (= name "backups")
+                                    (p/resolved backups-handle)
+                                    (throw (js/Error. (str "Unexpected dir: " name)))))
+                                :getFileHandle
+                                (fn [name _opts]
+                                  (if (= name "db.sqlite")
+                                    (p/resolved backup-file-handle)
+                                    (throw (js/Error. (str "Unexpected file: " name)))))}
+          root-handle #js {:name "MyBackups"
+                           :getDirectoryHandle (fn [_name _opts] (p/resolved graph-dir-handle))}
+          original-get-current-repo state/get-current-repo
+          original-invoke-db-worker state/<invoke-db-worker
+          original-idb-get-item idb/get-item
+          original-verify-permission browser-utils/verifyPermission
+          original-export-db persist-db/<export-db
+          original-get-files browser-utils/getFiles]
+      (set! util/web-platform? true)
+      (set! state/get-current-repo (constantly repo))
+      (set! browser-utils/verifyPermission (fn [_handle _rw] (p/resolved nil)))
+      (set! browser-utils/getFiles (fn [_handle _rec] (p/resolved #js [])))
+      (set! state/<invoke-db-worker
+            (fn [api repo' key]
+              (is (= :thread-api/get-key-value api))
+              (is (= repo repo'))
+              (is (= :logseq.kv/graph-backup-folder key))
+              (p/resolved "MyBackups")))
+      (set! idb/get-item
+            (fn [_key]
+              (p/resolved root-handle)))
+      (set! persist-db/<export-db
+            (fn [repo' opts]
+              (is (= repo repo'))
+              (is (= {:return-data? true} opts))
+              (p/resolved same-bytes)))
+      (letfn [(cleanup! []
+                (set! util/web-platform? web-platform?)
+                (set! state/get-current-repo original-get-current-repo)
+                (set! browser-utils/verifyPermission original-verify-permission)
+                (set! browser-utils/getFiles original-get-files)
+                (set! state/<invoke-db-worker original-invoke-db-worker)
+                (set! idb/get-item original-idb-get-item)
+                (set! persist-db/<export-db original-export-db)
+                (done))]
+        (-> (export/backup-db-graph repo)
+            (p/then
+             (fn [result]
+               (is (= :graph-not-changed result))
+               (is (empty? @archive-writes))
+               (is (empty? @db-writes))))
+            (p/catch
+             (fn [error]
+               (is false (str error))))
+            (p/finally cleanup!))))))
+
 (deftest auto-db-backup-skips-interval-when-worker-has-no-backup-folder-test
   (async done
     (let [repo "logseq_db_backup_worker"

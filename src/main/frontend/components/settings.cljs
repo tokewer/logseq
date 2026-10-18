@@ -13,6 +13,7 @@
             [frontend.handler.config :as config-handler]
             [frontend.handler.db-based.sync :as rtc-handler]
             [frontend.handler.global-config :as global-config-handler]
+            [frontend.handler.export :as export-handler]
             [frontend.handler.notification :as notification]
             [frontend.handler.plugin :as plugin-handler]
             [frontend.handler.property :as property-handler]
@@ -785,6 +786,43 @@
    {:left-label (t :server/title)
     :action (http-server-enabled-switcher t)}))
 
+(hsx/defc web-graph-folder-row
+  []
+  (let [repo (state/get-current-repo)
+        [folder set-folder!] (hooks/use-state nil)
+        supported? (export-handler/web-graph-folder-supported?)]
+    (hooks/use-effect!
+     (fn []
+       (if (and repo supported?)
+         (-> (export-handler/<get-web-graph-folder-name repo)
+             (p/then set-folder!))
+         (set-folder! nil)))
+     [repo supported?])
+    (when supported?
+      [:div.it.sm:grid.sm:grid-cols-3.sm:gap-4.sm:items-center
+       [:label.block.text-sm.font-medium.leading-5
+        (t :settings.features/web-graph-folder)]
+       [:div.mt-1.sm:mt-0.sm:col-span-2.flex.items-center.gap-2
+        (shui/button {:variant :default
+                      :disabled (nil? repo)
+                      :on-click (fn []
+                                  (try
+                                    (-> (export-handler/choose-web-graph-folder! repo)
+                                        (p/then set-folder!)
+                                        (p/catch (fn [error]
+                                                   (when-not (= "AbortError" (.-name error))
+                                                     (log/error :web-graph-folder/select-failed error)
+                                                     (notification/show!
+                                                      (t :settings.features/web-graph-folder-error (str error))
+                                                      :error)))))
+                                    (catch :default error
+                                      (log/error :web-graph-folder/select-failed error)
+                                      (notification/show!
+                                       (t :settings.features/web-graph-folder-error (str error))
+                                       :error))))}
+                     (t :settings.features/select-web-graph-folder))
+        (when folder [:span.text-sm.opacity-70 folder])]])))
+
 (defn flashcards-switcher-row [enable-flashcards?]
   (row-with-button-action
    {:left-label (t :settings.features/enable-flashcards)
@@ -1151,6 +1189,8 @@
           :on-key-press  (fn [e]
                            (when (= "Enter" (util/ekey e))
                              (update-home-page e)))}]]]]
+     (when web-platform?
+       (web-graph-folder-row))
      (when (and web-platform? config/feature-plugin-system-on?)
        (plugin-system-switcher-row))
      (when (util/electron?)

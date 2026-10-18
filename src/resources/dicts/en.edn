@@ -671,6 +671,8 @@
  :export.backup/cancel "Cancel backup"
  :export.backup/enabled-desc "Hourly backups are enabled for this graph, {1}."
  :export.backup/folder "Backup folder:"
+ :export.backup/handle-not-found "Backup folder is no longer accessible. Please select it again."
+ :export.backup/permission-expired "Backup folder permission has expired. Please select the folder again to restore access."
  :export.backup/hourly-note "Backup will be created every hour."
  :export.backup/open-folder "open backups folder for this graph"
  :export.backup/schedule "Schedule backup"
@@ -1739,6 +1741,9 @@
  :settings.features/semantic-search "Semantic search"
  :settings.features/semantic-search-desc "Include semantic matches in search results. Available on macOS Apple silicon."
  :settings.features/semantic-search-python3-missing "Install Python 3 to enable semantic search."
+ :settings.features/web-graph-folder "Web Graph Markdown folder"
+ :settings.features/select-web-graph-folder "Select Markdown folder"
+ :settings.features/web-graph-folder-error "Unable to select the Web Graph Markdown folder: {1}"
 
  :settings.general/accent-color "Accent color"
  :settings.general/accent-color-alert "Choosing an accent color may override any theme you have selected."

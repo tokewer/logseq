@@ -70,6 +70,69 @@
     (persist-db/<export-db repo {:return-data? true})))
 
 (def ^:private graph-backup-folder-key :logseq.kv/graph-backup-folder)
+(def ^:private web-graph-handle-prefix "web-graph/")
+
+(defn- safe-btoa
+  [s]
+  (try
+    (js/btoa s)
+    (catch :default _ nil)))
+
+(defn- web-graph-handle-key
+  [repo]
+  (when (string? repo)
+    (str web-graph-handle-prefix (js/encodeURIComponent repo))))
+
+(defn- backup-handle-key
+  [repo folder-name]
+  (if-let [encoded (safe-btoa repo)]
+    (str "handle/" encoded "/" folder-name)
+    (str "handle/" (js/encodeURIComponent repo) "/" folder-name)))
+
+(defn- legacy-backup-handle-key
+  [repo folder-name]
+  (str "handle/" (js/encodeURIComponent repo) "/" folder-name))
+
+(defn- <get-stored-backup-handle
+  [repo folder-name]
+  (p/let [key1 (backup-handle-key repo folder-name)
+          h1 (when key1 (idb/get-item key1))]
+    (if h1
+      h1
+      (let [key2 (legacy-backup-handle-key repo folder-name)]
+        (if (and key2 (not= key1 key2))
+          (idb/get-item key2)
+          (let [key3 (when-let [b (safe-btoa repo)] (str "handle/" b "/" folder-name))]
+            (if (and key3 (not= key1 key3) (not= key2 key3))
+              (idb/get-item key3)
+              nil)))))))
+
+(defn web-graph-folder-supported?
+  []
+  (fn? (.-showDirectoryPicker js/window)))
+
+(defn <get-web-graph-folder-name
+  [repo]
+  (when (string? repo)
+    (p/let [handle (or (idb/get-item (web-graph-handle-key repo))
+                       (when-let [legacy-key (try
+                                               (str web-graph-handle-prefix (js/btoa repo))
+                                               (catch :default _ nil))]
+                         (idb/get-item legacy-key)))]
+      (some-> handle .-name))))
+
+(defn choose-web-graph-folder!
+  [repo]
+  (when-not (string? repo)
+    (throw (ex-info "A graph must be selected before choosing a Web Graph folder"
+                    {:repo repo})))
+  (when-not (web-graph-folder-supported?)
+    (throw (ex-info "This browser does not support the File System Access API"
+                    {:feature :web-graph-folder})))
+  (p/let [handle (.showDirectoryPicker js/window #js {:mode "readwrite"})
+          _ (utils/verifyPermission handle true)
+          _ (idb/set-item! (web-graph-handle-key repo) handle)]
+    (.-name handle)))
 
 (defn- <get-key-value
   [repo key]
@@ -201,15 +264,47 @@
         (.setAttribute anchor "download" (file-name (str repo "_roam") :json))
         (.click anchor)))))
 
+(defn- same-binary-content?
+  [^js buf1 ^js buf2]
+  (if (or (nil? buf1) (nil? buf2))
+    false
+    (let [u1 (if (instance? js/Uint8Array buf1) buf1 (js/Uint8Array. buf1))
+          u2 (if (instance? js/Uint8Array buf2) buf2 (js/Uint8Array. buf2))
+          len1 (.-byteLength u1)
+          len2 (.-byteLength u2)]
+      (if (not= len1 len2)
+        false
+        (let [d1 (js/DataView. (.-buffer u1) (.-byteOffset u1) len1)
+              d2 (js/DataView. (.-buffer u2) (.-byteOffset u2) len2)
+              words (quot len1 4)
+              rem (rem len1 4)]
+          (loop [i 0]
+            (if (< i words)
+              (let [offset (* i 4)]
+                (if (not= (.getUint32 d1 offset true) (.getUint32 d2 offset true))
+                  false
+                  (recur (inc i))))
+              (loop [j (- len1 rem)]
+                (if (< j len1)
+                  (if (not= (aget u1 j) (aget u2 j))
+                    false
+                    (recur (inc j)))
+                  true)))))))))
+
 (defn- truncate-old-versioned-files!
   "reserve the latest 12 version files"
   [^js backups-handle]
-  (p/let [files (utils/getFiles backups-handle true)
-          old-versioned-files (drop 12 (reverse (sort-by (fn [^js file] (.-name file)) files)))]
-    (p/map (fn [^js files]
-             (doseq [^js file files]
-               (.remove (.-handle file))))
-           old-versioned-files)))
+  (-> (p/let [files (utils/getFiles backups-handle false)
+              old-files (drop 12 (reverse (sort-by (fn [^js file] (.-name file)) files)))]
+        (p/all
+         (map (fn [^js file]
+                (p/catch
+                 (.removeEntry backups-handle (.-name file))
+                 (fn [err]
+                   (js/console.warn "Failed to remove old backup file:" (.-name file) err))))
+              old-files)))
+      (p/catch (fn [err]
+                 (js/console.warn "Failed to truncate old versioned files:" err)))))
 
 (defn choose-backup-folder
   [repo]
@@ -217,7 +312,7 @@
           handle (first result)
           folder-name (.-name handle)
           _ (idb/set-item!
-             (str "handle/" (js/btoa repo) "/" folder-name) handle)
+             (backup-handle-key repo folder-name) handle)
           _ (state/<invoke-db-worker :thread-api/transact
                                      repo
                                      [(ldb/kv graph-backup-folder-key folder-name)]
@@ -226,63 +321,111 @@
     (js/console.dir handle)
     [folder-name handle]))
 
+(defn- <resolve-backup-handle
+  "Resolve a writable directory handle for `backup-folder`.
+   Re-prompts the user to pick the folder again when the stored handle is
+   missing or its permission has expired (e.g. after the page origin
+   changed or the browser revoked access)."
+  ([repo backup-folder]
+   (<resolve-backup-handle repo backup-folder {:interactive? true}))
+  ([repo backup-folder {:keys [interactive?] :or {interactive? true}}]
+   (p/let [handle (<get-stored-backup-handle repo backup-folder)]
+     (if handle
+       (if interactive?
+         (-> (utils/verifyPermission handle true)
+             (p/then (fn [_] [backup-folder handle]))
+             (p/catch (fn [e]
+                        (if (= "AbortError" (.-name e))
+                          nil
+                          (do
+                            (js/console.warn "Backup folder permission expired, requesting re-selection:" e)
+                            (notification/show! (t :export.backup/permission-expired) :warning)
+                            (choose-backup-folder repo))))))
+         ;; Non-interactive (background timer): query permission without user prompt to avoid SecurityError
+         (-> (.queryPermission handle #js {:mode "readwrite"})
+             (p/then (fn [perm]
+                       (if (= perm "granted")
+                         [backup-folder handle]
+                         (do
+                           (js/console.warn "Backup folder permission not granted in background:" perm)
+                           nil))))
+             (p/catch (fn [e]
+                        (js/console.warn "Failed to query permission in background:" e)
+                        nil))))
+       (if interactive?
+         (p/do!
+          (js/console.warn "Backup folder handle not found in IndexedDB")
+          (notification/show! (t :export.backup/handle-not-found) :warning)
+          (choose-backup-folder repo))
+         (do
+           (js/console.warn "Backup folder handle not found in background")
+           nil))))))
+
 (defn- web-backup-db-graph
-  [repo]
-  (when (and repo (= repo (state/get-current-repo)))
-    (p/let [backup-folder (<get-key-value repo graph-backup-folder-key)]
-      (when backup-folder
-        ;; ensure file handle exists
-        ;; ask user to choose a folder again when access expires
-        (p/let [handle (try
-                         (idb/get-item (str "handle/" (js/btoa repo) "/" backup-folder))
-                         (catch :default _e
-                           (throw (ex-info "Backup file handle no longer exists" {:repo repo}))))
-                [_folder handle] (when handle
-                                   (try
-                                     (utils/verifyPermission handle true)
-                                     [backup-folder handle]
-                                     (catch :default e
-                                       (js/console.error e)
-                                       (choose-backup-folder repo))))
-                repo-name (common-sqlite/sanitize-db-name repo)]
-          (if handle
-            (->
-             (p/let [graph-dir-handle (.getDirectoryHandle handle repo-name #js {:create true})
-                     backups-handle (.getDirectoryHandle graph-dir-handle "backups" #js {:create true})
-                     backup-handle ^js (.getFileHandle graph-dir-handle "db.sqlite" #js {:create true})
-                     file ^js (.getFile backup-handle)
-                     file-content (.text file)
-                     data (persist-db/<export-db repo {:return-data? true})
-                     decoded-content (.decode (js/TextDecoder.) data)]
-               (if (= file-content decoded-content)
-                 (do
-                   (println "Graph has not been updated since last export.")
-                   :graph-not-changed)
-                 (p/do!
-                  (when (> (.-size file) 0)
-                    (.move backup-handle backups-handle (str (util/time-ms) ".db.sqlite")))
-                  (truncate-old-versioned-files! backups-handle)
-                  (p/let [new-backup-handle ^js (.getFileHandle graph-dir-handle "db.sqlite" #js {:create true})]
-                    (utils/writeFile new-backup-handle data))
-                  (println "Successfully created a backup for" repo-name "at" (str (js/Date.)) ".")
-                  true)))
-             (p/catch (fn [error]
-                        (js/console.error error))))
-            (p/do!
-              ;; handle cleared
-             (notification/show! (t :export/db-backup-error) :error)
-             false)))))))
+  ([repo]
+   (web-backup-db-graph repo {:interactive? true}))
+  ([repo {:keys [interactive?] :or {interactive? true}}]
+   (when (and repo (= repo (state/get-current-repo)))
+     (->
+      (p/let [backup-folder (<get-key-value repo graph-backup-folder-key)]
+        (when backup-folder
+          (p/let [[folder-name handle] (<resolve-backup-handle repo backup-folder {:interactive? interactive?})]
+            (if (and folder-name handle)
+              (let [repo-name (common-sqlite/sanitize-db-name repo)]
+                (->
+                 (p/let [graph-dir-handle (.getDirectoryHandle handle repo-name #js {:create true})
+                         backups-handle (.getDirectoryHandle graph-dir-handle "backups" #js {:create true})
+                         backup-handle ^js (.getFileHandle graph-dir-handle "db.sqlite" #js {:create true})
+                         file ^js (.getFile backup-handle)
+                         file-size (.-size file)
+                         data (persist-db/<export-db repo {:return-data? true})
+                         data-len (or (.-byteLength data) (.-length data))
+                         unchanged? (when (and (> file-size 0) (= file-size data-len))
+                                      (p/let [file-buf (.arrayBuffer file)]
+                                        (same-binary-content? file-buf data)))]
+                   (if unchanged?
+                     (do
+                       (println "Graph has not been updated since last export.")
+                       :graph-not-changed)
+                     (p/do!
+                      (when (> file-size 0)
+                        (p/let [archive-name (str (util/time-ms) ".db.sqlite")
+                                archive-file-handle (.getFileHandle backups-handle archive-name #js {:create true})
+                                archive-writable (.createWritable archive-file-handle)]
+                          (p/do!
+                           (.write archive-writable file)
+                           (.close archive-writable))))
+                      (truncate-old-versioned-files! backups-handle)
+                      (utils/writeFile backup-handle data)
+                      (println "Successfully created a backup for" repo-name "at" (str (js/Date.)) ".")
+                      true)))
+                 (p/catch (fn [error]
+                            (when-not (= "AbortError" (.-name error))
+                              (js/console.error "Database backup error:" error)
+                              (when interactive?
+                                (notification/show! (t :export/db-backup-error) :error)))
+                            false))))
+              (when interactive?
+                (notification/show! (t :export/db-backup-error) :error)
+                false)))))
+      (p/catch (fn [error]
+                 (when-not (= "AbortError" (.-name error))
+                   (js/console.error "Backup failed:" error))
+                 false))))))
 
 (defn backup-db-graph
-  [repo]
-  (when util/web-platform?
-    (web-backup-db-graph repo)))
+  ([repo]
+   (backup-db-graph repo {:interactive? true}))
+  ([repo opts]
+   (when util/web-platform?
+     (web-backup-db-graph repo opts))))
 
 (defonce *backup-interval (atom nil))
 (defn cancel-db-backup!
   []
   (when-let [i @*backup-interval]
-    (js/clearInterval i)))
+    (js/clearInterval i)
+    (reset! *backup-interval nil)))
 
 (defn auto-db-backup!
   [repo]
@@ -294,6 +437,6 @@
         (cancel-db-backup!)
 
         ;; run backup every hour
-        (let [interval (js/setInterval #(backup-db-graph repo)
+        (let [interval (js/setInterval #(backup-db-graph repo {:interactive? false})
                                        (* 1 60 60 1000))]
           (reset! *backup-interval interval))))))
