@@ -76,7 +76,7 @@
 (defn- safe-btoa
   [s]
   (try
-    (js/btoa s)
+    (js/btoa (js/unescape (js/encodeURIComponent s)))
     (catch :default _ nil)))
 
 (defn- web-graph-handle-key
@@ -86,9 +86,7 @@
 
 (defn- backup-handle-key
   [repo folder-name]
-  (if-let [encoded (safe-btoa repo)]
-    (str "handle/" encoded "/" folder-name)
-    (str "handle/" (js/encodeURIComponent repo) "/" folder-name)))
+  (str "handle/" (js/encodeURIComponent (str repo)) "/" (js/encodeURIComponent (str folder-name))))
 
 (defn- legacy-backup-handle-key
   [repo folder-name]
@@ -101,12 +99,51 @@
     (if h1
       h1
       (let [key2 (legacy-backup-handle-key repo folder-name)]
-        (if (and key2 (not= key1 key2))
-          (idb/get-item key2)
+        (if-let [h2 (when (and key2 (not= key1 key2)) (idb/get-item key2))]
+          h2
           (let [key3 (when-let [b (safe-btoa repo)] (str "handle/" b "/" folder-name))]
-            (if (and key3 (not= key1 key3) (not= key2 key3))
-              (idb/get-item key3)
-              nil)))))))
+            (if-let [h3 (when (and key3 (not= key1 key3) (not= key2 key3)) (idb/get-item key3))]
+              h3
+              (idb/get-item (web-graph-handle-key repo)))))))))
+
+(defonce ^:private *server-storage-state (atom nil))
+
+(defn <get-server-storage-config
+  "Check if local storage server (/api/storage/config) is active and return config map."
+  []
+  (-> (js/fetch "/api/storage/config" #js {:method "GET"})
+      (p/then (fn [res]
+                (if (.-ok res)
+                  (.json res)
+                  nil)))
+      (p/then (fn [json]
+                (if (and json (.-ok json))
+                  (let [cfg (js->clj json :keywordize-keys true)]
+                    (reset! *server-storage-state cfg)
+                    cfg)
+                  (do
+                    (reset! *server-storage-state false)
+                    nil))))
+      (p/catch (fn [_]
+                 (reset! *server-storage-state false)
+                 nil))))
+
+(defn <save-db-to-server!
+  "Persist SQLite database directly to local physical disk folder via local server API."
+  [repo data]
+  (-> (js/fetch "/api/storage/save"
+                #js {:method "POST"
+                     :headers #js {"Content-Type" "application/octet-stream"
+                                   "X-Logseq-Repo" (js/encodeURIComponent (str repo))}
+                     :body data})
+      (p/then (fn [res]
+                (if (.-ok res)
+                  (.json res)
+                  (p/rejected (ex-info "Server save failed" {:status (.-status res)})))))
+      (p/then (fn [^js json]
+                (let [path (.-saved_path json)]
+                  (js/console.log (str "[ServerStorage] Successfully saved " repo " to disk: " path))
+                  (js->clj json :keywordize-keys true))))))
 
 (defn web-graph-folder-supported?
   []
@@ -132,8 +169,15 @@
                     {:feature :web-graph-folder})))
   (p/let [handle (.showDirectoryPicker js/window #js {:mode "readwrite"})
           _ (utils/verifyPermission handle true)
-          _ (idb/set-item! (web-graph-handle-key repo) handle)]
-    (.-name handle)))
+          folder-name (.-name handle)
+          _ (idb/set-item! (web-graph-handle-key repo) handle)
+          _ (idb/set-item! (backup-handle-key repo folder-name) handle)
+          _ (state/<invoke-db-worker :thread-api/transact
+                                     repo
+                                     [(ldb/kv graph-backup-folder-key folder-name)]
+                                     nil
+                                     nil)]
+    folder-name))
 
 (defn- <get-key-value
   [repo key]
@@ -312,8 +356,8 @@
   (p/let [result (utils/openDirectory #js {:mode "readwrite"})
           handle (first result)
           folder-name (.-name handle)
-          _ (idb/set-item!
-             (backup-handle-key repo folder-name) handle)
+          _ (idb/set-item! (web-graph-handle-key repo) handle)
+          _ (idb/set-item! (backup-handle-key repo folder-name) handle)
           _ (state/<invoke-db-worker :thread-api/transact
                                      repo
                                      [(ldb/kv graph-backup-folder-key folder-name)]
@@ -368,46 +412,67 @@
   ([repo {:keys [interactive?] :or {interactive? true}}]
    (when (and repo (= repo (state/get-current-repo)))
      (->
-      (p/let [backup-folder (<get-key-value repo graph-backup-folder-key)]
-        (when backup-folder
-          (p/let [[folder-name handle] (<resolve-backup-handle repo backup-folder {:interactive? interactive?})]
-            (if (and folder-name handle)
-              (let [repo-name (common-sqlite/sanitize-db-name repo)]
-                (->
-                 (p/let [graph-dir-handle (.getDirectoryHandle handle repo-name #js {:create true})
-                         backups-handle (.getDirectoryHandle graph-dir-handle "backups" #js {:create true})
-                         backup-handle ^js (.getFileHandle graph-dir-handle "db.sqlite" #js {:create true})
-                         file ^js (.getFile backup-handle)
-                         file-size (.-size file)
-                         data (persist-db/<export-db repo {:return-data? true})
-                         data-len (or (.-byteLength data) (.-length data))
-                         unchanged? (when (and (> file-size 0) (= file-size data-len))
-                                      (p/let [file-buf (.arrayBuffer file)]
-                                        (same-binary-content? file-buf data)))]
-                   (if unchanged?
-                     (do
-                       (println "Graph has not been updated since last export.")
-                       :graph-not-changed)
-                     (p/do!
-                      (when (> file-size 0)
-                        (p/let [archive-name (str (util/time-ms) ".db.sqlite")
-                                archive-file-handle (.getFileHandle backups-handle archive-name #js {:create true})
-                                archive-writable (.createWritable archive-file-handle)]
-                          (p/do!
-                           (.write archive-writable file)
-                           (.close archive-writable))))
-                      (truncate-old-versioned-files! backups-handle)
-                      (utils/writeFile backup-handle data)
-                      (println "Successfully created a backup for" repo-name "at" (str (js/Date.)) ".")
-                      true)))
-                 (p/catch (fn [error]
-                            (when-not (= "AbortError" (.-name error))
-                              (js/console.error "Database backup error:" error)
-                              (when interactive?
-                                (notification/show! (t :export/db-backup-error) :error)))
-                            false))))
-              (when interactive?
-                (notification/show! (t :export/db-backup-error) :error)
+      (p/let [server-cfg (<get-server-storage-config)
+              backup-folder (<get-key-value repo graph-backup-folder-key)
+              folder-name (or backup-folder
+                              (<get-web-graph-folder-name repo))
+              data (persist-db/<export-db repo {:return-data? true})]
+        (p/let [server-save-res (when server-cfg
+                                  (p/catch (<save-db-to-server! repo data)
+                                           (fn [err]
+                                             (js/console.warn "[ServerStorage] Server save failed:" err)
+                                             nil)))
+                fs-save-res (when folder-name
+                              (p/catch
+                               (p/let [[_ handle] (<resolve-backup-handle repo folder-name {:interactive? interactive?})]
+                                 (if handle
+                                   (let [repo-name (common-sqlite/sanitize-db-name repo)]
+                                     (p/let [graph-dir-handle (.getDirectoryHandle handle repo-name #js {:create true})
+                                             backups-handle (.getDirectoryHandle graph-dir-handle "backups" #js {:create true})
+                                             backup-handle ^js (.getFileHandle graph-dir-handle "db.sqlite" #js {:create true})
+                                             file ^js (.getFile backup-handle)
+                                             file-size (.-size file)
+                                             data-len (or (.-byteLength data) (.-length data))
+                                             unchanged? (when (and (> file-size 0) (= file-size data-len))
+                                                          (p/let [file-buf (.arrayBuffer file)]
+                                                            (same-binary-content? file-buf data)))]
+                                       (if unchanged?
+                                         :graph-not-changed
+                                         (p/do!
+                                          (when (> file-size 0)
+                                            (p/let [archive-name (str (util/time-ms) ".db.sqlite")
+                                                    archive-file-handle (.getFileHandle backups-handle archive-name #js {:create true})
+                                                    archive-writable (.createWritable archive-file-handle)]
+                                              (p/do!
+                                               (.write archive-writable file)
+                                               (.close archive-writable))))
+                                          (truncate-old-versioned-files! backups-handle)
+                                          (utils/writeFile backup-handle data)
+                                          (println "Successfully created a backup for" repo-name "at" (str (js/Date.)) ".")
+                                          true))))
+                                   false))
+                               (fn [err]
+                                 (js/console.warn "[FileSystemHandle] Database backup error:" err)
+                                 false)))]
+          (cond
+            (or server-save-res (true? fs-save-res))
+            (do
+              (println "Graph successfully persisted to local physical disk.")
+              true)
+
+            (= fs-save-res :graph-not-changed)
+            :graph-not-changed
+
+            :else
+            (if (and (nil? server-cfg) (nil? folder-name))
+              (if interactive?
+                (do
+                  (notification/show! (t :export.backup/set-folder-first) :warning)
+                  (choose-web-graph-folder! repo))
+                false)
+              (do
+                (when interactive?
+                  (notification/show! (t :export/db-backup-error) :error))
                 false)))))
       (p/catch (fn [error]
                  (when-not (= "AbortError" (.-name error))

@@ -57,8 +57,10 @@
     (hooks/use-effect!
      (fn []
        (if repo
-         (p/let [backup-folder (<get-key-value repo :logseq.kv/graph-backup-folder)]
-           (reset! *backup-folder backup-folder))
+         (p/let [bf1 (<get-key-value repo :logseq.kv/graph-backup-folder)
+                 bf2 (when-not bf1 (export/<get-web-graph-folder-name repo))
+                 folder (or bf1 bf2)]
+           (reset! *backup-folder folder))
          (reset! *backup-folder nil)))
      [repo])
     [:div.flex.flex-col.gap-4

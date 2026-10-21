@@ -3,6 +3,7 @@ $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $static = Join-Path $root 'static'
 $index = Join-Path $static 'index.html'
 $mainJs = Join-Path $static 'js/main.js'
+$serverScript = Join-Path $root 'server.py'
 $bind = '127.0.0.1'
 $port = 4173
 $baseUrl = "http://${bind}:${port}"
@@ -18,6 +19,8 @@ function Get-ProcessCommandLine([int] $processId) {
 
 function Test-LogseqPage {
     try {
+        $ping = Invoke-WebRequest -Uri "$baseUrl/api/ping" -UseBasicParsing -TimeoutSec 2 -ErrorAction SilentlyContinue
+        if ($ping -and $ping.StatusCode -eq 200) { return $true }
         $indexResponse = Invoke-WebRequest -Uri "$baseUrl/index.html" -UseBasicParsing -TimeoutSec 2
         if ($indexResponse.StatusCode -ne 200 -or $indexResponse.Content -notmatch 'id="root"') {
             return $false
@@ -33,9 +36,10 @@ function Test-OurServerProcess([int] $processId) {
     $commandLine = Get-ProcessCommandLine $processId
     if (-not $commandLine) { return $false }
     $pathMatch = ($commandLine.IndexOf($static, [StringComparison]::OrdinalIgnoreCase) -ge 0) -or
+                 ($commandLine.IndexOf("server.py", [StringComparison]::OrdinalIgnoreCase) -ge 0) -or
                  ($commandLine -match '(?i)--directory\s+["'']?static["'']?')
     return ($pathMatch -and
-        $commandLine -match '(?i)-m\s+http\.server' -and
+        ($commandLine -match '(?i)server\.py' -or $commandLine -match '(?i)-m\s+http\.server') -and
         $commandLine -match '(?i)(^|\s)4173(\s|$)')
 }
 
@@ -77,7 +81,13 @@ $python = Get-Command python.exe -ErrorAction SilentlyContinue
 if (-not $python) { $python = Get-Command python -ErrorAction SilentlyContinue }
 if (-not $python) { throw 'Python was not found. Install Python 3 and add python.exe to PATH.' }
 
-$server = Start-Process -FilePath $python.Source -ArgumentList @('-m', 'http.server', "$port", '--bind', $bind, '--directory', $static) -WorkingDirectory $root -WindowStyle Hidden -PassThru
+$serverArgs = if (Test-Path $serverScript) {
+    @($serverScript, "$port", '--bind', $bind)
+} else {
+    @('-m', 'http.server', "$port", '--bind', $bind, '--directory', $static)
+}
+
+$server = Start-Process -FilePath $python.Source -ArgumentList $serverArgs -WorkingDirectory $root -WindowStyle Hidden -PassThru
 $ready = $false
 for ($attempt = 0; $attempt -lt 120; $attempt++) {
     Start-Sleep -Milliseconds 250

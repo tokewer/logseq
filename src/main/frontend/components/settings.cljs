@@ -16,6 +16,7 @@
             [frontend.handler.db-based.sync :as rtc-handler]
             [frontend.handler.global-config :as global-config-handler]
             [frontend.handler.export :as export-handler]
+            [frontend.handler.auto-save :as auto-save]
             [frontend.handler.notification :as notification]
             [frontend.handler.plugin :as plugin-handler]
             [frontend.handler.property :as property-handler]
@@ -805,38 +806,71 @@
   []
   (let [repo (state/get-current-repo)
         [folder set-folder!] (hooks/use-state nil)
+        [server-cfg set-server-cfg!] (hooks/use-state nil)
+        [save-status set-save-status!] (hooks/use-state nil)
         supported? (export-handler/web-graph-folder-supported?)]
     (hooks/use-effect!
      (fn []
-       (if (and repo supported?)
-         (-> (export-handler/<get-web-graph-folder-name repo)
-             (p/then set-folder!))
-         (set-folder! nil)))
+       (when repo
+         (when supported?
+           (-> (export-handler/<get-web-graph-folder-name repo)
+               (p/then set-folder!)))
+         (-> (export-handler/<get-server-storage-config)
+             (p/then (fn [cfg] (when cfg (set-server-cfg! cfg)))))))
      [repo supported?])
-    (when supported?
+    (when (or supported? server-cfg)
       [:div.it.sm:grid.sm:grid-cols-3.sm:gap-4.sm:items-center
-       [:label.block.text-sm.font-medium.leading-5
-        (t :settings.features/web-graph-folder)]
-       [:div.mt-1.sm:mt-0.sm:col-span-2.flex.items-center.gap-2
-        (shui/button {:variant :default
-                      :disabled (nil? repo)
-                      :on-click (fn []
-                                  (try
-                                    (-> (export-handler/choose-web-graph-folder! repo)
-                                        (p/then set-folder!)
-                                        (p/catch (fn [error]
-                                                   (when-not (= "AbortError" (.-name error))
-                                                     (log/error :web-graph-folder/select-failed error)
-                                                     (notification/show!
-                                                      (t :settings.features/web-graph-folder-error (str error))
-                                                      :error)))))
-                                    (catch :default error
-                                      (log/error :web-graph-folder/select-failed error)
-                                      (notification/show!
-                                       (t :settings.features/web-graph-folder-error (str error))
-                                       :error))))}
-                     (t :settings.features/select-web-graph-folder))
-        (when folder [:span.text-sm.opacity-70 folder])]])))
+       [:div
+        [:label.block.text-sm.font-medium.leading-5
+         "本地存储文件夹"]
+        [:p.text-xs.opacity-50.mt-1
+         "数据自动直存至物理磁盘文件夹，不在浏览器缓存隔离"]]
+       [:div.mt-1.sm:mt-0.sm:col-span-2.flex.flex-col.gap-2
+        [:div.flex.items-center.gap-2.flex-wrap
+         (when supported?
+           (shui/button {:variant :default
+                         :disabled (nil? repo)
+                         :on-click (fn []
+                                     (try
+                                       (-> (export-handler/choose-web-graph-folder! repo)
+                                           (p/then (fn [name]
+                                                     (set-folder! name)
+                                                     (notification/show! (str "已选定本地文件夹: " name) :success)))
+                                           (p/catch (fn [error]
+                                                      (when-not (= "AbortError" (.-name error))
+                                                        (log/error :web-graph-folder/select-failed error)
+                                                        (notification/show! (str "选择文件夹失败: " error) :error)))))
+                                       (catch :default error
+                                         (log/error :web-graph-folder/select-failed error)
+                                         (notification/show! (str "选择文件夹失败: " error) :error))))}
+                        "选择本地物理文件夹"))
+         (shui/button {:variant :outline
+                       :disabled (nil? repo)
+                       :on-click (fn []
+                                   (set-save-status! "正在保存...")
+                                   (-> (export-handler/backup-db-graph repo {:interactive? true})
+                                       (p/then (fn [res]
+                                                 (if (= res :graph-not-changed)
+                                                   (do
+                                                     (set-save-status! "已是最新（无变更）")
+                                                     (notification/show! "数据与本地磁盘一致，无新变更" :success))
+                                                   (do
+                                                     (let [now (.toLocaleTimeString (js/Date.))]
+                                                       (set-save-status! (str "已保存 " now))
+                                                       (notification/show! "已成功保存到本地文件夹！" :success))))))
+                                       (p/catch (fn [err]
+                                                  (set-save-status! "保存失败")
+                                                  (notification/show! (str "保存失败: " err) :error)))))}
+                      "立即保存到本地磁盘")
+         (when save-status
+           [:span.text-xs.text-green-500.font-medium save-status])]
+        [:div.text-xs.opacity-70.flex.flex-col.gap-1
+         (when-let [target-dir (:target_dir server-cfg)]
+           [:div [:strong "磁盘物理路径: "] [:code.bg-gray-100.dark:bg-gray-800.px-1.rounded (str target-dir "\\" (or repo "default"))]])
+         (when folder [:div [:strong "浏览器授权文件夹: "] [:span folder]])
+         (if server-cfg
+           [:div.text-green-600.dark:text-green-400 "● 本地存储服务在线，实时编辑将自动秒级写入物理磁盘 db.sqlite 与备份"]
+           [:div.text-amber-600.dark:text-amber-400 "○ 提示：请确保启动本地服务（start-web.ps1）或完成文件夹授权以持久化"])]]])))
 
 (defn flashcards-switcher-row [enable-flashcards?]
   (row-with-button-action
