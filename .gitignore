@@ -13,7 +13,11 @@ pom.xml.asc
 .nbb/
 
 node_modules
-static/**
+static/*
+!static/index.html
+!static/js/
+static/js/*
+!static/js/backup-indicator.js
 tmp
 cljs-test-runner-out
 .tmp/

@@ -56,12 +56,16 @@
            (if (= target-version curr)
              ;; Current version fully synced to disk
              (do
-               (swap! *persistence-state update repo
-                      (fn [s]
-                        (assoc s
-                               :saved-version target-version
-                               :status :idle
-                               :last-error nil)))
+               (let [d (js/Date.)
+                     pad (fn [n] (if (< n 10) (str "0" n) (str n)))
+                     time-str (str (pad (.getHours d)) ":" (pad (.getMinutes d)) ":" (pad (.getSeconds d)))]
+                 (swap! *persistence-state update repo
+                        (fn [s]
+                          (assoc s
+                                 :saved-version target-version
+                                 :status :idle
+                                 :last-saved-time time-str
+                                 :last-error nil))))
                (when (not= result :graph-not-changed)
                  (js/console.log (str "[" (now-iso) "] [AutoSave] Successfully persisted version " target-version " for " repo)))
                result)

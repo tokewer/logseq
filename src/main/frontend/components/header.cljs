@@ -24,6 +24,7 @@
             [frontend.db.async :as db-async]
             [frontend.db.hooks :as db-hooks]
             [frontend.handler :as handler]
+            [frontend.handler.auto-save :as auto-save]
             [frontend.handler.page :as page-handler]
             [frontend.handler.plugin :as plugin-handler]
             [frontend.handler.route :as route-handler]
@@ -521,6 +522,92 @@
        [:div.search-index-progress__bar
         [:div.search-index-progress__bar-fill {:style {:width (str progress' "%")}}]]])))
 
+(hsx/defc backup-status-indicator
+  [current-repo]
+  (let [persistence-state (hooks/use-atom-value auto-save/*persistence-state)
+        repo-state (get persistence-state current-repo)
+        status (or (:status repo-state) :idle)
+        last-saved-time (or (:last-saved-time repo-state) "刚刚")
+        tooltip-text (case status
+                       :saving "正在自动备份当前数据..."
+                       :dirty "有未保存改动 (停止输入1秒后自动写入本地，或按 Ctrl+S)"
+                       :error "本地备份异常，点击查看详情并重试"
+                       (str "已备份至本地磁盘 (上次保存: " last-saved-time ")"))]
+    (when current-repo
+      (ui/tooltip
+       (shui/button
+        {:type "button"
+         :variant :ghost
+         :size :icon
+         :class (str "ui__button inline-flex cursor-pointer items-center justify-center rounded-md h-6 w-6 p-1 relative "
+                     (case status
+                       :saving "text-blue-500 hover:text-blue-600"
+                       :dirty "text-amber-500 hover:text-amber-600"
+                       :error "text-red-500 hover:text-red-600"
+                       "text-emerald-600 dark:text-emerald-400 opacity-80 hover:opacity-100"))
+         :aria-label tooltip-text
+         :on-click (fn [^js e]
+                     (shui/popup-show!
+                      (.-currentTarget e)
+                      (fn [{:keys [id]}]
+                        [:div.p-3.flex.flex-col.gap-2.5.text-sm.select-none {:style {:minWidth "280px" :maxWidth "340px"}}
+                         [:div.flex.items-center.justify-between.border-b.border-border.pb-2
+                          [:div.flex.items-center.gap-1.5.font-semibold.text-sm
+                           [:span "💾"]
+                           [:span "本地数据备份状态"]]
+                          [:span.text-xs.px-2.py-0.5.rounded-full.font-medium
+                           {:class (case status
+                                     :saving "bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300"
+                                     :dirty "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300"
+                                     :error "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300"
+                                     "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300")}
+                           (case status
+                             :saving "正在写入..."
+                             :dirty "待保存"
+                             :error "写入失败"
+                             "已完全备份")]]
+
+                         [:div.flex.flex-col.gap-1.5.text-xs.opacity-80.py-0.5
+                          [:div.flex.justify-between.items-center
+                           [:span.opacity-70 "存储模式:"]
+                           [:span.font-mono.text-emerald-600.dark:text-emerald-400.font-medium "物理磁盘直存 (原子写入)"]]
+                          [:div.flex.justify-between.items-center
+                           [:span.opacity-70 "当前图谱:"]
+                           [:span.font-semibold current-repo]]
+                          [:div.flex.justify-between.items-center
+                           [:span.opacity-70 "最近备份:"]
+                           [:span.font-mono last-saved-time]]
+                          [:div.flex.justify-between.items-center
+                           [:span.opacity-70 "历史备份镜像:"]
+                           [:span.font-mono "backups/ (自动保留10份)"]]]
+
+                         [:div.border-t.border-border.pt-2.flex.flex-col.gap-1.5
+                          (shui/button
+                           {:variant :default
+                            :size :sm
+                            :class "w-full flex items-center justify-center gap-1.5 text-xs font-medium"
+                            :on-click (fn []
+                                        (p/do!
+                                         (auto-save/flush-save! current-repo)
+                                         (notification/show! "已成功强制保存并生成最新备份快照！" :success)
+                                         (shui/popup-hide! id)))}
+                           (ui/icon "device-floppy" {:size 14})
+                           "立即备份当前内容 (Ctrl+S)")]])
+                      {:align "end"
+                       :as-dropdown? true
+                       :focus-trigger? false
+                       :content-props {:class "w-72"}}))}
+       [:span.ui__icon.ti.relative.flex.items-center.justify-center
+        (case status
+          :saving [:span.animate-spin (ui/icon "refresh" {:size 18})]
+          :dirty [:span.relative (ui/icon "database" {:size 18})
+                  [:span.absolute.-top-0.5.-right-0.5.w-2.h-2.rounded-full.bg-amber-500.animate-pulse]]
+          :error [:span (ui/icon "alert-triangle" {:size 18})]
+          [:span.relative (ui/icon "database" {:size 18})
+           [:span.absolute.-top-0.5.-right-0.5.w-2.h-2.rounded-full.bg-emerald-500 {:style {:boxShadow "0 0 4px rgba(16, 185, 129, 0.7)"}}]])]
+       tooltip-text
+       {:trigger-props {:as-child true}}))))
+
 (hsx/defc ^:large-vars/cleanup-todo header-aux
   [{:keys [current-repo default-home new-block-mode]}]
   (let [electron-mac? (and util/mac? (util/electron?))
@@ -619,6 +706,9 @@
        (when config/publishing?
          [:a.text-sm.font-medium.button {:href (rfe/href :graph)}
           (t :nav/graph)])
+
+       (when current-repo
+         (backup-status-indicator current-repo))
 
        (toolbar-dots-menu {:t            t
                            :current-repo current-repo

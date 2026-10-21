@@ -1,5 +1,23 @@
 # Logseq GitHub 同步记录 (GitHub Sync Log)
 
+## [v0.0.6] - 2026-10-21 11:14:36
+
+- **同步目标**: GitHub 仓库 `tokewer/logseq`
+- **同步分支**: `master` & `gh-pages`
+- **提交说明**: feat: 在 Logseq 页面顶部栏增加原生风格数据备份状态指示器与即时备份面板
+- **变更文件清单**:
+  - `M .gitignore`
+  - `M data/storage_config.json`
+  - `M src/main/frontend/components/header.cljs`
+  - `M src/main/frontend/handler/auto_save.cljs`
+  - `?? scripts/verified_live.png`
+  - `?? scripts/verified_popup_live.png`
+  - `?? scripts/verify_backup_ui.mjs`
+  - `?? static/`
+- **同步状态**: ✅ 已成功同步至 GitHub 仓库与静态托管站点 (https://tokewer.github.io/logseq/)
+
+---
+
 ## [v0.0.5] - 2026-10-21 09:28:52
 
 - **同步目标**: GitHub 仓库 `tokewer/logseq`
