@@ -19,6 +19,25 @@ function run(cmd, cwd) {
   return execSync(cmd, { cwd, stdio: 'inherit' })
 }
 
+function runWithRetry(cmd, cwd, maxRetries = 4, delayMs = 3000) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`执行命令 (尝试 ${attempt}/${maxRetries}): ${cmd}`)
+      execSync(cmd, { cwd, stdio: 'inherit' })
+      return true
+    } catch (err) {
+      console.warn(`⚠️ 第 ${attempt} 次执行失败: ${err.message}`)
+      if (attempt < maxRetries) {
+        console.log(`⏳ 等待 ${delayMs / 1000} 秒后自动重试...`)
+        execSync(`node -e "setTimeout(() => {}, ${delayMs})"`)
+      } else {
+        throw err
+      }
+    }
+  }
+  return false
+}
+
 function copyRecursive(src, dest, options = {}) {
   const { excludeDirs = [], excludeFiles = [], excludeExts = [] } = options
   fs.mkdirSync(dest, { recursive: true })
@@ -115,7 +134,7 @@ try {
   run(`git remote add origin ${originUrl}`, tempDir)
   run('git add -A', tempDir)
   run('git commit -m "Deploy Logseq Web clean build to GitHub Pages" -q', tempDir)
-  run('git push origin gh-pages --force', tempDir)
+  runWithRetry('git push origin gh-pages --force', tempDir, 4, 3000)
 
   console.log('\n========================================================')
   console.log('🎉 GitHub Pages 部署成功！')
