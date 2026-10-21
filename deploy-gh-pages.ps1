@@ -1,5 +1,13 @@
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$mjsScript = Join-Path $root 'scripts/deploy-gh-pages.mjs'
+
+if (Test-Path -LiteralPath $mjsScript) {
+    Write-Host ">>> Delegating deployment to node scripts/deploy-gh-pages.mjs ..."
+    & node $mjsScript
+    exit $LASTEXITCODE
+}
+
 $static = Join-Path $root 'static'
 $index = Join-Path $static 'index.html'
 $mainJs = Join-Path $static 'js/main.js'

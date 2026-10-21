@@ -1,5 +1,19 @@
 # Logseq GitHub 同步记录 (GitHub Sync Log)
 
+## [v0.0.5] - 2026-10-21 09:28:52
+
+- **同步目标**: GitHub 仓库 `tokewer/logseq`
+- **同步分支**: `master` & `gh-pages`
+- **提交说明**: 修复 GitHub Pages 部署静态资源缺失与构建异常，全面恢复线上访问并验证所有资源
+- **变更文件清单**:
+  - `M deploy-gh-pages.ps1`
+  - `M scripts/auto-sync-github.mjs`
+  - `?? scripts/deploy-gh-pages.mjs`
+  - `?? scripts/verify-deployment.mjs`
+- **同步状态**: ✅ 已成功同步至 GitHub 仓库与静态托管站点 (https://tokewer.github.io/logseq/)
+
+---
+
 ## [v0.0.4] - 2026-10-21 08:51:51
 
 - **同步目标**: GitHub 仓库 `tokewer/logseq`

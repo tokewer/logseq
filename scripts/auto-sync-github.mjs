@@ -193,10 +193,16 @@ try {
   // 7. 部署并同步到 gh-pages 分支
   console.log('\n🌐 正在同步更新 GitHub Pages 静态托管 (gh-pages 分支)...')
   try {
-    const deployScript = path.join(rootDir, 'deploy-gh-pages.ps1')
-    if (fs.existsSync(deployScript)) {
-      runInteractive(`powershell -NoProfile -ExecutionPolicy Bypass -File "${deployScript}"`)
+    const deployNodeScript = path.join(rootDir, 'scripts', 'deploy-gh-pages.mjs')
+    if (fs.existsSync(deployNodeScript)) {
+      runInteractive(`node "${deployNodeScript}"`)
       console.log('✅ GitHub Pages 静态分支部署完成！')
+    } else {
+      const deployScript = path.join(rootDir, 'deploy-gh-pages.ps1')
+      if (fs.existsSync(deployScript)) {
+        runInteractive(`powershell -NoProfile -ExecutionPolicy Bypass -File "${deployScript}"`)
+        console.log('✅ GitHub Pages 静态分支部署完成！')
+      }
     }
   } catch (deployErr) {
     console.warn('⚠️ GitHub Pages 自动部署脚本执行提示:', deployErr.message)
