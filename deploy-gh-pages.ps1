@@ -5,28 +5,33 @@ $index = Join-Path $static 'index.html'
 $mainJs = Join-Path $static 'js/main.js'
 
 if (-not (Test-Path -LiteralPath $index) -or -not (Test-Path -LiteralPath $mainJs)) {
-    throw "Web 构建不完整，未找到 '$index' 或 '$mainJs'，请先完成 Web 构建。"
+    throw "Web build is incomplete. Required files: '$index' and '$mainJs'."
 }
 
-$tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("logseq_pages_" + [System.Guid]::NewGuid().ToString("N"))
-Write-Host ">>> 正在准备静态发布目录: $tempDir"
+$tempFolder = "logseq_pages_" + [System.Guid]::NewGuid().ToString("N")
+$tempDir = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath $tempFolder
+Write-Host ">>> Preparing temporary deployment directory: $tempDir"
 New-Item -ItemType Directory -Path $tempDir | Out-Null
 
 try {
-    # 复制子目录（排除 node_modules 等无用大目录）
-    $excludeDirs = @('node_modules', 'android', 'ios')
-    Get-ChildItem -Path $static -Directory | Where-Object { $_.Name -notin $excludeDirs } | ForEach-Object {
-        Copy-Item -Path $_.FullName -Destination (Join-Path $tempDir $_.Name) -Recurse -Force
+    # 仅复制静态托管所需的纯前端资产目录（使用 robocopy 排除 .map 文件）
+    $neededDirs = @('css', 'docs', 'icons', 'img', 'js', 'windows')
+    foreach ($d in $neededDirs) {
+        $srcDir = Join-Path $static $d
+        if (Test-Path $srcDir) {
+            $destDir = Join-Path $tempDir $d
+            & robocopy $srcDir $destDir /E /XF *.map /NFL /NDL /NJH /NJS /nc /ns /np | Out-Null
+        }
     }
 
-    # 复制根文件（排除 electron 构建文件及未打包文件）
-    $excludeFiles = @('electron.js', 'electron.js.map', 'db-worker-node.js.map', 'tests.js.map', 'electron-builder.yml', 'forge.config.test.js', 'entitlements.plist', 'package.json', 'pnpm-lock.yaml')
-    Get-ChildItem -Path $static -File | Where-Object { $_.Name -notin $excludeFiles -and $_.Extension -ne '.map' } | ForEach-Object {
-        Copy-Item -Path $_.FullName -Destination $tempDir -Force
+    # 复制静态根文件
+    $rootFiles = @('index.html', '404.html', 'favicon.ico', 'manifest.json', 'robots.txt')
+    foreach ($f in $rootFiles) {
+        $srcFile = Join-Path $static $f
+        if (Test-Path $srcFile) {
+            Copy-Item -Path $srcFile -Destination (Join-Path $tempDir $f) -Force
+        }
     }
-
-    # 递归删除多余的 source map 文件以缩减体积
-    Get-ChildItem -Path $tempDir -Filter "*.map" -Recurse -File | Remove-Item -Force
 
     # 创建 .nojekyll 防止 GitHub Pages 过滤特殊文件
     New-Item -ItemType File -Path (Join-Path $tempDir ".nojekyll") -Force | Out-Null
@@ -41,7 +46,7 @@ try {
 
     $pIndex = Join-Path $tempDir "index.html"
     $contentIndex = Get-Content $pIndex -Raw
-    $spaScript = @"
+    $spaScript = @'
   <!-- Start Single Page Apps for GitHub Pages -->
   <script type="text/javascript">
     (function(l) {
@@ -57,7 +62,7 @@ try {
   </script>
   <!-- End Single Page Apps for GitHub Pages -->
 </head>
-"@
+'@
     if ($contentIndex -notmatch 'Single Page Apps for GitHub Pages') {
         $contentIndex = $contentIndex -replace '</head>', $spaScript
         Set-Content -Path $pIndex -Value $contentIndex -Encoding utf8
@@ -68,7 +73,7 @@ try {
     $originUrl = git remote get-url origin
     Pop-Location
 
-    Write-Host ">>> 正在提交静态页面并推送到 origin/gh-pages ..."
+    Write-Host ">>> Committing and pushing static bundle to origin/gh-pages ..."
     Push-Location $tempDir
     git init -q
     git checkout -b gh-pages -q
@@ -78,7 +83,7 @@ try {
     git push origin gh-pages --force
     Pop-Location
 
-    Write-Host ">>> 发布成功！GitHub Pages 静态托管地址: https://tokewer.github.io/logseq/"
+    Write-Host ">>> Deployment successful! Live URL: https://tokewer.github.io/logseq/"
 } finally {
     if (Test-Path $tempDir) {
         Remove-Item -Recurse -Force $tempDir -ErrorAction SilentlyContinue
