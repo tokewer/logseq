@@ -95,7 +95,7 @@
                               (when folder-name
                                 (reset! *backup-folder folder-name)
                                 (export/auto-db-backup! repo)
-                                (p/let [result (auto-save/flush-save! repo)]
+                                (p/let [result (export/backup-db-graph repo {:interactive? true})]
                                   (case result
                                     true
                                     (notification/show! (t :export/backup-successful) :success)
@@ -115,7 +115,7 @@
            {:variant :default
             :on-click (fn []
                         (->
-                         (p/let [result (auto-save/flush-save! repo)]
+                         (p/let [result (export/backup-db-graph repo {:interactive? true})]
                            (case result
                              true
                              (notification/show! (t :export/backup-successful) :success)
