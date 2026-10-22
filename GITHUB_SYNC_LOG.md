@@ -1,5 +1,21 @@
 # Logseq GitHub 同步记录 (GitHub Sync Log)
 
+## [v0.0.7] - 2026-10-22 22:54:51
+
+- **同步目标**: GitHub 仓库 `tokewer/logseq`
+- **同步分支**: `master` & `gh-pages`
+- **提交说明**: feat: 重构自动保存与水合引擎，实现物理磁盘直存与自动同步
+- **变更文件清单**:
+  - `M GITHUB_SYNC_LOG.md`
+  - `M data/storage_config.json`
+  - `M server.py`
+  - `M static/js/backup-indicator.js`
+  - `?? scripts/test_engine_end_to_end.mjs`
+  - `?? scripts/verified_engine_popup.png`
+- **同步状态**: ✅ 已成功同步至 GitHub 仓库与静态托管站点 (https://tokewer.github.io/logseq/)
+
+---
+
 ## [v0.0.6] - 2026-10-21 11:14:36
 
 - **同步目标**: GitHub 仓库 `tokewer/logseq`
@@ -76,3 +92,12 @@
 
 本文档记录每次向 GitHub (`tokewer/logseq`) 仓库同步更新的完整操作历史。
 
+- [2026-10-22 22:20:51] 自动保存便签数据: 图谱=`logseq_db_Demo`, 大小=`409600` 字节, 路径=`F:\新学习资料分站\数据\随笔便签\logseq_db_Demo\db.sqlite`
+- [2026-10-22 22:24:58] 自动保存便签数据: 图谱=`logseq_db_Demo`, 大小=`409600` 字节, 路径=`F:\新学习资料分站\数据\随笔便签\logseq_db_Demo\db.sqlite`
+- [2026-10-22 22:29:12] 自动保存便签数据: 图谱=`logseq_db_Demo`, 大小=`409600` 字节, 路径=`F:\新学习资料分站\数据\随笔便签\logseq_db_Demo\db.sqlite`
+- [2026-10-22 22:30:20] 自动保存便签数据: 图谱=`logseq_db_Demo`, 大小=`409600` 字节, 路径=`F:\新学习资料分站\数据\随笔便签\logseq_db_Demo\db.sqlite`
+- [2026-10-22 22:38:59] 自动保存便签数据: 图谱=`logseq_db_Demo`, 大小=`2` 字节, 路径=`F:\新学习资料分站\数据\随笔便签\logseq_db_Demo\db.sqlite`
+- [2026-10-22 22:45:59] 自动保存便签数据: 图谱=`高三—`, 大小=`10936320` 字节, 路径=`F:\新学习资料分站\数据\随笔便签\高三—\db.sqlite`
+- [2026-10-22 22:49:13] 自动保存便签数据: 图谱=`高三—`, 大小=`10936320` 字节, 路径=`F:\新学习资料分站\数据\随笔便签\高三—\db.sqlite`
+- [2026-10-22 22:50:32] 自动保存便签数据: 图谱=`高三—`, 大小=`10936320` 字节, 路径=`F:\新学习资料分站\数据\随笔便签\高三—\db.sqlite`
+- [2026-10-22 22:53:12] 自动保存便签数据: 图谱=`高三—`, 大小=`10936320` 字节, 路径=`F:\新学习资料分站\数据\随笔便签\高三—\db.sqlite`

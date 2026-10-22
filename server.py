@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 Logseq Web - 本地存储服务与静态服务器
-参考 mind-map-main 架构：
+核心特性：
 1. 静态资源托管（static 目录，支持 gzip、etag、SPA 404 回退）
-2. 本地文件夹直存 API (/api/storage/save, /api/storage/config, /api/storage/load)
-   - 彻底摆脱浏览器沙盒与 OPFS 隔离，将数据以 SQLite 二进制格式直接写入选定物理磁盘文件夹
-   - 采用原子写入（_atomic_write），避免并发与中断损坏
-   - 自动生成版本化备份（backups/<timestamp>.db.sqlite），保留最近多份备份
-3. GitHub 自动同步与 Markdown 日志记录接口 (/api/sync/github)
+2. 本地文件夹直存 API：
+   - /api/storage/graphs: 扫描并列出本地物理磁盘的所有图谱及数据库状态
+   - /api/storage/config: 获取/更新存储目标目录
+   - /api/storage/load: 读取指定图谱的物理 db.sqlite 文件并返回二进制数据
+   - /api/storage/save: 原子写入 SQLite 数据库二进制文件，并保留最近 10 份历史备份快照
+   - /api/storage/log: 写入 GITHUB_SYNC_LOG.md 变更记录
+3. 彻底摆脱浏览器沙盒与 OPFS 易失性限制，确保数据始终与本地物理磁盘实时同步
 """
 import http.server
 import socketserver
@@ -21,9 +23,9 @@ import tempfile
 import threading
 import subprocess
 import time
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlparse, parse_qs
 
-# 确保在 Windows 控制台下输出 UTF-8，防止 GBK 编码异常
+# Windows 控制台编码安全配置
 if sys.platform == 'win32':
     try:
         if hasattr(sys.stdout, 'reconfigure'):
@@ -65,7 +67,7 @@ STATIC_DIR = os.path.join(ROOT, 'static')
 DATA_DIR = os.path.join(ROOT, 'data')
 CONFIG_FILE = os.path.join(DATA_DIR, 'storage_config.json')
 
-# 默认数据保存目录（参考用户本地数据目录）
+# 默认数据物理存储根目录
 DEFAULT_TARGET_DIR = r"F:\新学习资料分站\数据\随笔便签"
 
 GZIP_EXT = ('.js', '.css', '.html', '.json', '.svg', '.wasm')
@@ -92,10 +94,9 @@ def load_config():
                     return json.load(f)
             except Exception as e:
                 print(f"[Server] Warning: Failed to load config file: {e}")
-        # Default config
         cfg = {
             "target_dir": DEFAULT_TARGET_DIR,
-            "version": "1.0.0",
+            "version": "1.1.0",
             "last_saved": None
         }
         try:
@@ -116,12 +117,12 @@ def save_config(cfg):
 def _sanitize_name(name):
     if not name:
         return 'default'
-    # 允许中文、英文、数字、下划线、破折号
-    s = re.sub(r'[^\w\u4e00-\u9fa5\-_.]', '_', str(name)).strip()
+    # 允许中文、英文、数字、破折号、下划线及各类常见标点
+    s = re.sub(r'[\\/:*?"<>|\r\n\t]', '_', str(name)).strip()
     return s or 'default'
 
 def _atomic_write(target_path, data_bytes):
-    """先写入目标目录内的临时文件再原子替换，避免写入中断导致损坏"""
+    """先写入目标目录内的唯一临时文件再原子替换，彻底避免半写数据和损坏"""
     directory = os.path.dirname(target_path) or '.'
     os.makedirs(directory, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix='.tmp-logseq-', dir=directory)
@@ -131,7 +132,6 @@ def _atomic_write(target_path, data_bytes):
             f.flush()
             os.fsync(f.fileno())
         with _file_write_lock:
-            # 在 Windows 上，若目标文件存在，os.replace 可安全替换
             os.replace(tmp, target_path)
     except Exception as e:
         try:
@@ -141,7 +141,7 @@ def _atomic_write(target_path, data_bytes):
         raise e
 
 def _rotate_backups(backups_dir, max_keep=MAX_BACKUPS):
-    """保持 backups 文件夹内最多 max_keep 个历史备份文件"""
+    """保持 backups 文件夹内最多保留 max_keep 份历史备份"""
     try:
         if not os.path.exists(backups_dir):
             return
@@ -160,12 +160,22 @@ def _rotate_backups(backups_dir, max_keep=MAX_BACKUPS):
     except Exception as e:
         print(f"[Server] Warning rotating backups: {e}")
 
+def _append_to_sync_log(repo_name, saved_path, file_size):
+    """将数据保存行为记录到 GITHUB_SYNC_LOG.md，确保每次更新都有迹可循"""
+    try:
+        log_path = os.path.join(ROOT, 'GITHUB_SYNC_LOG.md')
+        now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+        entry = f"- [{now_str}] 自动保存便签数据: 图谱=`{repo_name}`, 大小=`{file_size}` 字节, 路径=`{saved_path}`\n"
+        with open(log_path, 'a', encoding='utf-8') as f:
+            f.write(entry)
+    except Exception as e:
+        print(f"[Server] Warning appending to sync log: {e}")
+
 class LogseqServerHandler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=STATIC_DIR, **kwargs)
 
     def log_message(self, format, *args):
-        # 简化日志，只输出 API 或错误
         msg = format % args
         if '/api/' in msg or ' 50' in msg or ' 40' in msg:
             print(f"[HTTP] {self.address_string()} - {msg}")
@@ -194,16 +204,16 @@ class LogseqServerHandler(http.server.SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
 
-        # 1. API: Ping / 健康检查
+        # 1. API: 健康检查
         if path == '/api/ping':
             return self._send_json(200, {
                 "ok": True,
                 "status": "running",
-                "version": "1.0.0",
+                "version": "1.1.0",
                 "server": "logseq-storage-server"
             })
 
-        # 2. API: 获取配置与状态
+        # 2. API: 获取存储目录与全局配置
         if path == '/api/storage/config':
             cfg = load_config()
             target_dir = cfg.get("target_dir", DEFAULT_TARGET_DIR)
@@ -215,7 +225,47 @@ class LogseqServerHandler(http.server.SimpleHTTPRequestHandler):
                 "last_saved": cfg.get("last_saved")
             })
 
-        # 3. API: 获取指定 repo 的本地文件信息与数据
+        # 3. API: 扫描并列出本地磁盘所有便签图谱
+        if path == '/api/storage/graphs':
+            cfg = load_config()
+            target_dir = cfg.get("target_dir", DEFAULT_TARGET_DIR)
+            graphs = []
+            if os.path.exists(target_dir):
+                for name in os.listdir(target_dir):
+                    dir_path = os.path.join(target_dir, name)
+                    if not os.path.isdir(dir_path):
+                        continue
+                    db_file = os.path.join(dir_path, "db.sqlite")
+                    # 支持直接存在或嵌套一层子目录的结构
+                    if not os.path.isfile(db_file):
+                        nested_db = os.path.join(dir_path, name, "db.sqlite")
+                        if os.path.isfile(nested_db):
+                            db_file = nested_db
+                    
+                    if os.path.isfile(db_file):
+                        try:
+                            stat = os.stat(db_file)
+                            backups_dir = os.path.join(dir_path, "backups")
+                            b_count = len(os.listdir(backups_dir)) if os.path.isdir(backups_dir) else 0
+                            graphs.append({
+                                "name": name,
+                                "db_path": db_file,
+                                "size": stat.st_size,
+                                "mtime": int(stat.st_mtime * 1000),
+                                "mtime_str": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime)),
+                                "backups_count": b_count
+                            })
+                        except Exception:
+                            pass
+            # 按最后修改时间倒序排列
+            graphs.sort(key=lambda g: g["mtime"], reverse=True)
+            return self._send_json(200, {
+                "ok": True,
+                "target_dir": target_dir,
+                "graphs": graphs
+            })
+
+        # 4. API: 读取指定 repo 的本地 SQLite 数据库二进制数据
         if path == '/api/storage/load':
             from urllib.parse import parse_qs
             qs = parse_qs(parsed.query)
@@ -223,10 +273,13 @@ class LogseqServerHandler(http.server.SimpleHTTPRequestHandler):
             repo_clean = _sanitize_name(repo)
             cfg = load_config()
             target_dir = cfg.get("target_dir", DEFAULT_TARGET_DIR)
-            # 兼容两种组织结构：<target_dir>/<repo>/db.sqlite 或 <target_dir>/db.sqlite
+
+            # 多层候选路径搜索（防止文件夹命名或嵌套偏差）
             candidates = [
-                os.path.join(target_dir, repo_clean, "db.sqlite"),
                 os.path.join(target_dir, repo, "db.sqlite"),
+                os.path.join(target_dir, repo_clean, "db.sqlite"),
+                os.path.join(target_dir, repo, repo, "db.sqlite"),
+                os.path.join(target_dir, repo_clean, repo_clean, "db.sqlite"),
                 os.path.join(target_dir, "db.sqlite")
             ]
             found = None
@@ -249,6 +302,7 @@ class LogseqServerHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/x-sqlite3')
                 self.send_header('Content-Length', str(len(data)))
+                self.send_header('X-Logseq-Path', found.encode('utf-8').decode('latin-1', 'replace'))
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.send_header('Cache-Control', 'no-store')
                 self.end_headers()
@@ -257,8 +311,7 @@ class LogseqServerHandler(http.server.SimpleHTTPRequestHandler):
             except Exception as e:
                 return self._send_json(500, {"ok": False, "error": str(e)})
 
-        # 4. 静态资源托管
-        # 如果请求的文件不存在且不是以 /js、/css、/api、/assets 等开头，回退到 index.html（SPA 路由）
+        # 5. 静态资源托管与 SPA 回退
         fs_path = self.translate_path(self.path)
         if not os.path.exists(fs_path) and not path.startswith(('/api/', '/js/', '/css/', '/fonts/', '/assets/')):
             index_path = os.path.join(STATIC_DIR, 'index.html')
@@ -280,13 +333,32 @@ class LogseqServerHandler(http.server.SimpleHTTPRequestHandler):
 
                 content_type = self.headers.get('Content-Type', '')
                 repo_header = self.headers.get('X-Logseq-Repo', '')
-                repo = unquote(repo_header).strip() if repo_header else 'default'
+                repo = unquote(repo_header).strip() if repo_header else ''
+                if not repo or repo == 'default':
+                    qs = parse_qs(parsed.query)
+                    q_repo = qs.get('repo', [''])[0]
+                    if q_repo:
+                        repo = unquote(q_repo).strip()
+                if not repo:
+                    repo = 'default'
 
                 data_bytes = None
                 custom_target_dir = None
 
+                # 确保完整读取所有字节流（防止网络缓冲区导致的部分读取）
+                def read_all_bytes(total):
+                    rem = total
+                    parts = []
+                    while rem > 0:
+                        part = self.rfile.read(min(rem, 65536))
+                        if not part:
+                            break
+                        parts.append(part)
+                        rem -= len(part)
+                    return b''.join(parts)
+
                 if 'application/json' in content_type:
-                    raw_body = self.rfile.read(content_len).decode('utf-8')
+                    raw_body = read_all_bytes(content_len).decode('utf-8')
                     payload = json.loads(raw_body)
                     repo = payload.get('repo', repo)
                     b64 = payload.get('data')
@@ -294,8 +366,7 @@ class LogseqServerHandler(http.server.SimpleHTTPRequestHandler):
                     if b64:
                         data_bytes = base64.b64decode(b64)
                 else:
-                    # 二进制 stream
-                    data_bytes = self.rfile.read(content_len)
+                    data_bytes = read_all_bytes(content_len)
 
                 if not data_bytes or len(data_bytes) == 0:
                     return self._send_json(400, {"ok": False, "error": "Empty database payload"})
@@ -304,16 +375,18 @@ class LogseqServerHandler(http.server.SimpleHTTPRequestHandler):
                 target_base = custom_target_dir or cfg.get("target_dir", DEFAULT_TARGET_DIR)
                 repo_name = _sanitize_name(repo)
 
-                # 物理存储结构（与 Logseq 原生导出目录结构一致）：
-                # <target_base>/<repo_name>/db.sqlite
-                # <target_base>/<repo_name>/backups/<timestamp>.db.sqlite
-                repo_dir = os.path.join(target_base, repo_name)
+                # 智能消除嵌套目录：若 target_base 本身已指向当前图谱目录，不重复拼合
+                if os.path.basename(os.path.normpath(target_base)) == repo_name:
+                    repo_dir = target_base
+                else:
+                    repo_dir = os.path.join(target_base, repo_name)
+
                 backups_dir = os.path.join(repo_dir, "backups")
                 os.makedirs(backups_dir, exist_ok=True)
 
                 target_db_path = os.path.join(repo_dir, "db.sqlite")
 
-                # 如果目标已有文件且内容与新写入数据一致，直接跳过以节省磁盘写入
+                # 如果目标已有文件且内容与新写入数据一致，直接跳过以节省磁盘与 I/O 开销
                 if os.path.isfile(target_db_path) and os.path.getsize(target_db_path) == len(data_bytes):
                     try:
                         with open(target_db_path, 'rb') as f:
@@ -339,7 +412,7 @@ class LogseqServerHandler(http.server.SimpleHTTPRequestHandler):
                 # 2. 原子更新主数据库文件 db.sqlite
                 _atomic_write(target_db_path, data_bytes)
 
-                # 3. 更新配置状态
+                # 3. 更新配置状态与同步日志
                 now_str = time.strftime("%Y-%m-%d %H:%M:%S")
                 cfg["last_saved"] = {
                     "repo": repo,
@@ -348,8 +421,9 @@ class LogseqServerHandler(http.server.SimpleHTTPRequestHandler):
                     "time": now_str
                 }
                 save_config(cfg)
+                _append_to_sync_log(repo_name, target_db_path, len(data_bytes))
 
-                print(f"[Server] Successfully persisted {repo_name} to disk: {target_db_path} ({len(data_bytes)} bytes)")
+                print(f"[Server] 成功自动保存便签图谱 [{repo_name}] 至物理磁盘: {target_db_path} ({len(data_bytes)} 字节)")
                 return self._send_json(200, {
                     "ok": True,
                     "saved_path": target_db_path,
@@ -361,7 +435,7 @@ class LogseqServerHandler(http.server.SimpleHTTPRequestHandler):
                 print(f"[Server] Error saving database: {e}")
                 return self._send_json(500, {"ok": False, "error": str(e)})
 
-        # 2. API: 更新保存目录配置
+        # 2. API: 更新目标文件夹配置
         if path == '/api/storage/config':
             try:
                 content_len = int(self.headers.get('Content-Length', 0))
@@ -396,7 +470,6 @@ class LogseqServerHandler(http.server.SimpleHTTPRequestHandler):
                 if not os.path.exists(sync_script):
                     return self._send_json(404, {"ok": False, "error": "auto-sync-github.mjs script not found"})
 
-                # 执行同步脚本
                 cmd = ['node', sync_script]
                 if msg:
                     cmd.append(msg)
@@ -424,7 +497,6 @@ def run_server():
     print(f"[Server] 服务监听地址: http://{BIND}:{PORT}")
     print("=" * 60)
 
-    # 允许端口快速重用
     socketserver.TCPServer.allow_reuse_address = True
     with socketserver.TCPServer((BIND, PORT), LogseqServerHandler) as httpd:
         try:
