@@ -1,0 +1,148 @@
+goog.provide('logseq.db.frontend.entity_util');
+logseq.db.frontend.entity_util.has_tag_QMARK_ = (function logseq$db$frontend$entity_util$has_tag_QMARK_(entity,tag_ident){
+if(((cljs.core.map_QMARK_(entity)) || (datascript.impl.entity.entity_QMARK_(entity)))){
+return cljs.core.some((function (t){
+return ((cljs.core.keyword_identical_QMARK_(new cljs.core.Keyword("db","ident","db/ident",-737096).cljs$core$IFn$_invoke$arity$1(t),tag_ident)) || (cljs.core.keyword_identical_QMARK_(t,tag_ident)));
+}),new cljs.core.Keyword("block","tags","block/tags",1814948340).cljs$core$IFn$_invoke$arity$1(entity));
+} else {
+return null;
+}
+});
+logseq.db.frontend.entity_util.internal_page_QMARK_ = (function logseq$db$frontend$entity_util$internal_page_QMARK_(entity){
+return logseq.db.frontend.entity_util.has_tag_QMARK_(entity,new cljs.core.Keyword("logseq.class","Page","logseq.class/Page",1484340329));
+});
+logseq.db.frontend.entity_util.class_QMARK_ = (function logseq$db$frontend$entity_util$class_QMARK_(entity){
+return logseq.db.frontend.entity_util.has_tag_QMARK_(entity,new cljs.core.Keyword("logseq.class","Tag","logseq.class/Tag",-538902083));
+});
+logseq.db.frontend.entity_util.property_QMARK_ = (function logseq$db$frontend$entity_util$property_QMARK_(entity){
+return logseq.db.frontend.entity_util.has_tag_QMARK_(entity,new cljs.core.Keyword("logseq.class","Property","logseq.class/Property",1038767048));
+});
+logseq.db.frontend.entity_util.closed_value_QMARK_ = (function logseq$db$frontend$entity_util$closed_value_QMARK_(entity){
+return (!((new cljs.core.Keyword("block","closed-value-property","block/closed-value-property",1157792813).cljs$core$IFn$_invoke$arity$1(entity) == null)));
+});
+/**
+ * Given a page entity or map, check if it is a journal page
+ */
+logseq.db.frontend.entity_util.journal_QMARK_ = (function logseq$db$frontend$entity_util$journal_QMARK_(entity){
+return logseq.db.frontend.entity_util.has_tag_QMARK_(entity,new cljs.core.Keyword("logseq.class","Journal","logseq.class/Journal",1979741081));
+});
+logseq.db.frontend.entity_util.page_QMARK_ = (function logseq$db$frontend$entity_util$page_QMARK_(entity){
+var or__5142__auto__ = logseq.db.frontend.entity_util.internal_page_QMARK_(entity);
+if(cljs.core.truth_(or__5142__auto__)){
+return or__5142__auto__;
+} else {
+var or__5142__auto____$1 = logseq.db.frontend.entity_util.journal_QMARK_(entity);
+if(cljs.core.truth_(or__5142__auto____$1)){
+return or__5142__auto____$1;
+} else {
+var or__5142__auto____$2 = logseq.db.frontend.entity_util.class_QMARK_(entity);
+if(cljs.core.truth_(or__5142__auto____$2)){
+return or__5142__auto____$2;
+} else {
+return logseq.db.frontend.entity_util.property_QMARK_(entity);
+}
+}
+}
+});
+/**
+ * Given an entity or map, check if it is an asset block
+ */
+logseq.db.frontend.entity_util.asset_QMARK_ = (function logseq$db$frontend$entity_util$asset_QMARK_(entity){
+return (!((new cljs.core.Keyword("logseq.property.asset","type","logseq.property.asset/type",-1142083098).cljs$core$IFn$_invoke$arity$1(entity) == null)));
+});
+/**
+ * First truthy result of `(f parent)` while walking `entity`'s :block/parent
+ *   chain, closest parent first. Stops on a parent without :db/id or a cycle.
+ */
+logseq.db.frontend.entity_util.some_parent = (function logseq$db$frontend$entity_util$some_parent(entity,f){
+var parent = new cljs.core.Keyword("block","parent","block/parent",-918309064).cljs$core$IFn$_invoke$arity$1(entity);
+var seen = cljs.core.PersistentHashSet.EMPTY;
+while(true){
+var temp__5825__auto__ = new cljs.core.Keyword("db","id","db/id",-1388397098).cljs$core$IFn$_invoke$arity$1(parent);
+if(cljs.core.truth_(temp__5825__auto__)){
+var parent_id = temp__5825__auto__;
+if(cljs.core.contains_QMARK_(seen,parent_id)){
+return null;
+} else {
+var or__5142__auto__ = (f.cljs$core$IFn$_invoke$arity$1 ? f.cljs$core$IFn$_invoke$arity$1(parent) : f.call(null,parent));
+if(cljs.core.truth_(or__5142__auto__)){
+return or__5142__auto__;
+} else {
+var G__40574 = new cljs.core.Keyword("block","parent","block/parent",-918309064).cljs$core$IFn$_invoke$arity$1(parent);
+var G__40575 = cljs.core.conj.cljs$core$IFn$_invoke$arity$2(seen,parent_id);
+parent = G__40574;
+seen = G__40575;
+continue;
+}
+}
+} else {
+return null;
+}
+break;
+}
+});
+logseq.db.frontend.entity_util.hidden_QMARK_ = (function logseq$db$frontend$entity_util$hidden_QMARK_(page){
+return cljs.core.boolean$((cljs.core.truth_(page)?((typeof page === 'string')?clojure.string.starts_with_QMARK_(page,"$$$"):((((cljs.core.map_QMARK_(page)) || (datascript.impl.entity.entity_QMARK_(page))))?(function (){var or__5142__auto__ = new cljs.core.Keyword("logseq.property","hide?","logseq.property/hide?",68365746).cljs$core$IFn$_invoke$arity$1(page);
+if(cljs.core.truth_(or__5142__auto__)){
+return or__5142__auto__;
+} else {
+var or__5142__auto____$1 = new cljs.core.Keyword("logseq.property","deleted-at","logseq.property/deleted-at",685213751).cljs$core$IFn$_invoke$arity$1(page);
+if(cljs.core.truth_(or__5142__auto____$1)){
+return or__5142__auto____$1;
+} else {
+return logseq.db.frontend.entity_util.some_parent(page,(function (parent){
+var or__5142__auto____$2 = new cljs.core.Keyword("logseq.property","hide?","logseq.property/hide?",68365746).cljs$core$IFn$_invoke$arity$1(parent);
+if(cljs.core.truth_(or__5142__auto____$2)){
+return or__5142__auto____$2;
+} else {
+return new cljs.core.Keyword("logseq.property","deleted-at","logseq.property/deleted-at",685213751).cljs$core$IFn$_invoke$arity$1(parent);
+}
+}));
+}
+}
+})():null)):null));
+});
+logseq.db.frontend.entity_util.recycled_QMARK_ = (function logseq$db$frontend$entity_util$recycled_QMARK_(entity){
+return cljs.core.boolean$(((((cljs.core.map_QMARK_(entity)) || (datascript.impl.entity.entity_QMARK_(entity))))?(function (){var or__5142__auto__ = new cljs.core.Keyword("logseq.property","deleted-at","logseq.property/deleted-at",685213751).cljs$core$IFn$_invoke$arity$1(entity);
+if(cljs.core.truth_(or__5142__auto__)){
+return or__5142__auto__;
+} else {
+return logseq.db.frontend.entity_util.some_parent(entity,new cljs.core.Keyword("logseq.property","deleted-at","logseq.property/deleted-at",685213751));
+}
+})():null));
+});
+logseq.db.frontend.entity_util.object_QMARK_ = (function logseq$db$frontend$entity_util$object_QMARK_(node){
+return cljs.core.seq(new cljs.core.Keyword("block","tags","block/tags",1814948340).cljs$core$IFn$_invoke$arity$1(node));
+});
+/**
+ * Get entity types from :block/tags
+ */
+logseq.db.frontend.entity_util.get_entity_types = (function logseq$db$frontend$entity_util$get_entity_types(entity){
+var ident__GT_type = new cljs.core.PersistentArrayMap(null, 4, [new cljs.core.Keyword("logseq.class","Tag","logseq.class/Tag",-538902083),new cljs.core.Keyword(null,"class","class",-2030961996),new cljs.core.Keyword("logseq.class","Property","logseq.class/Property",1038767048),new cljs.core.Keyword(null,"property","property",-1114278232),new cljs.core.Keyword("logseq.class","Journal","logseq.class/Journal",1979741081),new cljs.core.Keyword(null,"journal","journal",1585898830),new cljs.core.Keyword("logseq.class","Page","logseq.class/Page",1484340329),new cljs.core.Keyword(null,"page","page",849072397)], null);
+return cljs.core.set(cljs.core.map.cljs$core$IFn$_invoke$arity$2((function (p1__40572_SHARP_){
+var G__40573 = new cljs.core.Keyword("db","ident","db/ident",-737096).cljs$core$IFn$_invoke$arity$1(p1__40572_SHARP_);
+return (ident__GT_type.cljs$core$IFn$_invoke$arity$1 ? ident__GT_type.cljs$core$IFn$_invoke$arity$1(G__40573) : ident__GT_type.call(null,G__40573));
+}),new cljs.core.Keyword("block","tags","block/tags",1814948340).cljs$core$IFn$_invoke$arity$1(entity)));
+});
+/**
+ * Built-in page or block
+ */
+logseq.db.frontend.entity_util.built_in_QMARK_ = (function logseq$db$frontend$entity_util$built_in_QMARK_(entity){
+return new cljs.core.Keyword("logseq.property","built-in?","logseq.property/built-in?",-1125958160).cljs$core$IFn$_invoke$arity$1(entity);
+});
+logseq.db.frontend.entity_util.get_pages_by_name = (function logseq$db$frontend$entity_util$get_pages_by_name(db,page_name){
+return datascript.core.datoms.cljs$core$IFn$_invoke$arity$4(db,new cljs.core.Keyword(null,"avet","avet",1383857032),new cljs.core.Keyword("block","name","block/name",1619760316),logseq.common.util.page_name_sanity_lc(page_name));
+});
+/**
+ * Convert a db Entity to a map
+ */
+logseq.db.frontend.entity_util.entity__GT_map = (function logseq$db$frontend$entity_util$entity__GT_map(e){
+if(datascript.impl.entity.entity_QMARK_(e)){
+} else {
+throw (new Error("Assert failed: (de/entity? e)"));
+}
+
+return cljs.core.assoc.cljs$core$IFn$_invoke$arity$3(cljs.core.into.cljs$core$IFn$_invoke$arity$2(cljs.core.PersistentArrayMap.EMPTY,e),new cljs.core.Keyword("db","id","db/id",-1388397098),new cljs.core.Keyword("db","id","db/id",-1388397098).cljs$core$IFn$_invoke$arity$1(e));
+});
+
+//# sourceMappingURL=logseq.db.frontend.entity_util.js.map
