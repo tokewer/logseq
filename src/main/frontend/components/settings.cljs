@@ -866,7 +866,7 @@
            [:span.text-xs.text-green-500.font-medium save-status])]
         [:div.text-xs.opacity-70.flex.flex-col.gap-1
          (when-let [target-dir (:target_dir server-cfg)]
-           [:div [:strong "磁盘物理路径: "] [:code.bg-gray-100.dark:bg-gray-800.px-1.rounded (str target-dir "\\" (or repo "default"))]])
+           [:div [:strong "磁盘物理路径: "] [:code.bg-gray-100.dark:bg-gray-800.px-1.rounded (str target-dir "\\" (clojure.string.replace (str (or repo "高三")) #"^logseq_db_" ""))]])
          (when folder [:div [:strong "浏览器授权文件夹: "] [:span folder]])
          (if server-cfg
            [:div.text-green-600.dark:text-green-400 "● 本地存储服务在线，实时编辑将自动秒级写入物理磁盘 db.sqlite 与备份"]

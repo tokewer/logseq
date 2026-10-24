@@ -573,7 +573,7 @@
                            [:span.font-mono.text-emerald-600.dark:text-emerald-400.font-medium "物理磁盘直存 (原子写入)"]]
                           [:div.flex.justify-between.items-center
                            [:span.opacity-70 "当前图谱:"]
-                           [:span.font-semibold current-repo]]
+                           [:span.font-semibold (clojure.string.replace (str current-repo) #"^logseq_db_" "")]]
                           [:div.flex.justify-between.items-center
                            [:span.opacity-70 "最近备份:"]
                            [:span.font-mono last-saved-time]]

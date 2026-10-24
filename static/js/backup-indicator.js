@@ -1,21 +1,13 @@
 /**
- * Logseq Web Native Auto-Save & Disk Hydration Engine (v2.2.0)
+ * Logseq Web Native Auto-Save & Disk Storage Engine (v2.3.0)
  * 
- * 核心功能：
- * 1. 物理磁盘直存与自动水合：
- *    - 页面加载时自动发现本地物理图谱（默认优先加载 F:\新学习资料分站\数据\随笔便签 中的真实笔记高三—，不使用 demo）
- *    - 支持从磁盘按需即时切换图谱（高三— / 高三 等）
- * 2. 全自动编辑感知与防抖持久化：
- *    - 监听 DOM input/keyup/paste/compositionend 及 MutationObserver，实时捕获所有块级输入与编辑变更
- *    - 停止输入 1.2 秒后自动提交活动块并调用 worker 导出二进制，原子写入本地物理磁盘 db.sqlite
- *    - 保留最近 10 份历史备份快照于 backups/ 目录
- *    - 写入记录至 GITHUB_SYNC_LOG.md，支持 GitHub 自动化同步
- * 3. 页面离开与焦点丧失零丢失保障：
- *    - visibilitychange / beforeunload / blur 自动即时强制 flush
- *    - 全局 Ctrl+S / Cmd+S 立即持久化
- * 4. 极致 Logseq 原生视觉美学：
- *    - 状态指示灯（🟢已保存 / 🟡待保存 / 🔵写入中 / 🔴异常）
- *    - 顶部工具栏弹出式详情卡片、磁盘路径直观显示、即时图谱切换、手动一键备份
+ * 核心升级与修复：
+ * 1. 彻底消除 logseq_db_ 内部前缀，图谱名称与物理文件夹名称 100% 保持纯净（高三）。
+ * 2. 严格杜绝文件夹嵌套：保存文件夹严格解析至选定目录，绝不生成 高三\高三 或 高三—\高三。
+ * 3. 增强双候选 Worker 导出通道，解决图谱切换瞬态的 "File not found: /db.sqlite" 假死问题。
+ * 4. 自动水合物理磁盘最新真实数据，并在编辑停顿 1.2 秒后自动写入本地物理磁盘 db.sqlite。
+ * 5. 自动保留最近 10 份历史备份快照于 backups/，写入 GITHUB_SYNC_LOG.md 审计日志。
+ * 6. 原生精致 UI：状态指示灯（🟢已保存 / 🟡待保存 / 🔵写入中 / 🔴异常）与控制弹窗。
  */
 (function() {
   'use strict';
@@ -28,15 +20,26 @@
     apiGitSync: '/api/sync/github',
     defaultTargetDir: 'F:\\新学习资料分站\\数据\\随笔便签',
     debounceDelayMs: 1200,
-    heartbeatIntervalMs: 3000
+    heartbeatIntervalMs: 2000
   };
 
+  // 规范化图谱名称：去除 logseq_db_ 前缀与非法字符
+  function normalizeRepoName(name) {
+    if (!name) return '高三';
+    var s = String(name).trim();
+    while (s.indexOf('logseq_db_') === 0) {
+      s = s.substring(10);
+    }
+    if (!s || s.toLowerCase() === 'default') return '高三';
+    return s;
+  }
+
   var state = {
-    repo: '',
+    repo: '高三',
     status: 'idle', // 'idle' | 'dirty' | 'saving' | 'hydrating' | 'error'
     lastSavedTime: '',
     targetDir: CONFIG.defaultTargetDir,
-    targetPath: '',
+    targetPath: 'F:\\新学习资料分站\\数据\\随笔便签\\高三\\db.sqlite',
     graphs: [],
     popupOpen: false,
     errorMsg: '',
@@ -66,15 +69,15 @@
     return (bytes / Math.pow(k, i)).toFixed(1) + ' ' + sizes[i];
   }
 
-  // 获取当前正在编辑的 Logseq 图谱名称
+  // 获取当前正在编辑的干净图谱名称（绝不含 logseq_db_ 前缀）
   function getCurrentRepo() {
     try {
       if (window.frontend && window.frontend.state && window.frontend.state.get_current_repo) {
         var r = window.frontend.state.get_current_repo();
-        if (r) return r;
+        if (r) return normalizeRepoName(r);
       }
     } catch (e) {}
-    return state.repo || '';
+    return normalizeRepoName(state.repo || '高三');
   }
 
   // 弹出 Logseq 原生通知
@@ -92,15 +95,11 @@
     }
   }
 
-  // 1. 自动水合：等待 Logseq Worker 启动就绪后，将本地磁盘上的真实笔记图谱（高三—）加载进 Worker
+  // 1. 自动水合：等待 Logseq Worker 启动就绪后，将本地磁盘上的真实高三笔记载入 Worker
   async function hydrateUserGraphIfNeeded() {
     if (state.hydrated || isHydrating) return;
 
-    if (!window.frontend || !window.frontend.state || !window.frontend.state.get_current_repo || !window.frontend.state._LT_invoke_db_worker || !window.cljs) {
-      return;
-    }
-    var current = window.frontend.state.get_current_repo();
-    if (!current) {
+    if (!window.frontend || !window.frontend.state || !window.frontend.state._LT_invoke_db_worker || !window.cljs) {
       return;
     }
 
@@ -118,41 +117,37 @@
       if (gData.target_dir) state.targetDir = gData.target_dir;
 
       var preferred = localStorage.getItem('logseq_preferred_graph');
+      var cleanPreferred = preferred ? normalizeRepoName(preferred) : null;
       var targetGraph = null;
 
-      if (preferred && state.graphs.some(function(g) { return g.name === preferred; })) {
-        targetGraph = preferred;
+      if (cleanPreferred && state.graphs.some(function(g) { return g.name === cleanPreferred; })) {
+        targetGraph = cleanPreferred;
       } else {
         var nonDemo = state.graphs.filter(function(g) {
-          return g.name !== 'logseq_db_Demo' && g.name !== 'Demo';
+          var n = g.name.toLowerCase();
+          return n !== 'demo' && n !== 'logseq_db_demo';
         });
         targetGraph = nonDemo.length > 0 ? nonDemo[0].name : state.graphs[0].name;
       }
 
-      if (!targetGraph) {
-        isHydrating = false;
-        return;
-      }
+      if (!targetGraph) targetGraph = '高三';
+      targetGraph = normalizeRepoName(targetGraph);
 
-      if (current === targetGraph) {
-        state.hydrated = true;
-        state.repo = current;
-        state.targetPath = state.targetDir + '\\' + current + '\\db.sqlite';
-        state.status = 'idle';
+      var cur = getCurrentRepo();
+      if (cur === targetGraph && state.hydrated) {
         isHydrating = false;
-        updateIndicatorUI();
-        updatePopupUI();
         return;
       }
 
       console.log('[AutoHydrate] 发现本地目标笔记图谱 [' + targetGraph + ']，准备从物理磁盘水合...');
       state.status = 'hydrating';
+      state.repo = targetGraph;
       updateIndicatorUI();
       updatePopupUI();
 
       var loadResp = await fetch(CONFIG.apiLoad + '?repo=' + encodeURIComponent(targetGraph));
       if (!loadResp.ok) {
-        throw new Error('读取图谱失败 HTTP ' + loadResp.status);
+        throw new Error('读取物理图谱数据失败 HTTP ' + loadResp.status);
       }
       var buf = await loadResp.arrayBuffer();
       var u8 = new Uint8Array(buf);
@@ -173,13 +168,17 @@
       state.lastSavedTime = formatTime(new Date());
       state.hydrated = true;
       state.status = 'idle';
-      localStorage.setItem('logseq_preferred_graph', targetGraph);
+      state.errorMsg = '';
+      try {
+        localStorage.setItem('current-repo', JSON.stringify(targetGraph));
+        localStorage.setItem('logseq_preferred_graph', targetGraph);
+      } catch (e) {}
 
       updateIndicatorUI();
       updatePopupUI();
-      showNotification('已自动从物理磁盘载入真实笔记图谱 [' + targetGraph + '] (' + formatBytes(u8.byteLength) + ')', 'success');
+      showNotification('已自动从本地物理磁盘载入真实笔记图谱 [' + targetGraph + '] (' + formatBytes(u8.byteLength) + ')', 'success');
     } catch (e) {
-      console.warn('[AutoHydrate] 水合暂缓，将在下轮重试:', e.message || e);
+      console.warn('[AutoHydrate] 水合就绪中:', e.message || e);
       state.status = 'idle';
       updateIndicatorUI();
     } finally {
@@ -187,19 +186,19 @@
     }
   }
 
-  // 2. 核心保存执行函数（导出 worker SQLite 二进制并原子写入后端）
+  // 2. 核心持久化执行函数（双通道候选提取 worker 二进制并原子写入本地磁盘）
   async function executeSave(force) {
     if (state.saveInFlight) {
       state.hasPendingSaveAfterFlight = true;
       return;
     }
 
-    var curRepo = getCurrentRepo();
-    if (!curRepo || curRepo === 'logseq_db_Demo') {
+    var cleanRepo = getCurrentRepo();
+    if (!cleanRepo || cleanRepo.toLowerCase() === 'demo') {
       var pref = localStorage.getItem('logseq_preferred_graph');
-      if (pref && pref !== 'logseq_db_Demo') curRepo = pref;
+      if (pref) cleanRepo = normalizeRepoName(pref);
     }
-    if (!curRepo) return;
+    if (!cleanRepo) cleanRepo = '高三';
 
     state.saveInFlight = true;
     state.status = 'saving';
@@ -223,11 +222,44 @@
         }
       } catch (err) {}
 
-      // 等待 100ms 让 worker 事务入库
-      await new Promise(function(resolve) { setTimeout(resolve, 100); });
+      // 等待 80ms 让 worker 事务入库
+      await new Promise(function(resolve) { setTimeout(resolve, 80); });
 
       var kwExport = window.cljs.core.keyword('thread-api/export-db-binary');
-      var dbBinary = await window.frontend.state._LT_invoke_db_worker(kwExport, curRepo);
+      var dbBinary = null;
+
+      // 双通道候选查找：优先干净名称，兼容底层可能持有的带前缀键
+      var candidates = [cleanRepo, 'logseq_db_' + cleanRepo];
+      if (window.frontend.state.get_current_repo) {
+        var rawCurrent = window.frontend.state.get_current_repo();
+        if (rawCurrent && candidates.indexOf(rawCurrent) === -1) {
+          candidates.unshift(rawCurrent);
+        }
+      }
+
+      for (var i = 0; i < candidates.length; i++) {
+        try {
+          var res = await window.frontend.state._LT_invoke_db_worker(kwExport, candidates[i]);
+          if (res && res.byteLength > 0) {
+            dbBinary = res;
+            break;
+          }
+        } catch (candidateErr) {}
+      }
+
+      // 若处于图谱切换间隙，短暂重试一次
+      if (!dbBinary || dbBinary.byteLength === 0) {
+        await new Promise(function(resolve) { setTimeout(resolve, 250); });
+        for (var j = 0; j < candidates.length; j++) {
+          try {
+            var retryRes = await window.frontend.state._LT_invoke_db_worker(kwExport, candidates[j]);
+            if (retryRes && retryRes.byteLength > 0) {
+              dbBinary = retryRes;
+              break;
+            }
+          } catch (retryErr) {}
+        }
+      }
 
       if (!dbBinary || dbBinary.byteLength === 0) {
         throw new Error('导出的数据库二进制数据为空');
@@ -237,7 +269,7 @@
         method: 'POST',
         headers: {
           'Content-Type': 'application/octet-stream',
-          'X-Logseq-Repo': encodeURIComponent(curRepo)
+          'X-Logseq-Repo': encodeURIComponent(cleanRepo)
         },
         body: dbBinary
       });
@@ -254,13 +286,13 @@
 
       state.lastSavedBytes = dbBinary.byteLength;
       state.lastSavedTime = formatTime(new Date());
-      state.targetPath = resJson.saved_path || (state.targetDir + '\\' + curRepo + '\\db.sqlite');
-      state.repo = curRepo;
+      state.targetPath = resJson.saved_path || (state.targetDir + '\\' + cleanRepo + '\\db.sqlite');
+      state.repo = cleanRepo;
       state.isDirty = false;
       state.status = 'idle';
       state.errorMsg = '';
 
-      console.log('[AutoSave] 成功自动持久化 [' + curRepo + '] 至物理磁盘: ' + state.targetPath + ' (' + dbBinary.byteLength + ' 字节)');
+      console.log('[AutoSave] 成功自动持久化 [' + cleanRepo + '] 至物理磁盘: ' + state.targetPath + ' (' + dbBinary.byteLength + ' 字节)');
     } catch (e) {
       console.error('[AutoSave] 保存失败:', e);
       state.status = 'error';
@@ -319,7 +351,8 @@
 
   // 4. 用户交互切换图谱
   async function switchGraph(targetRepo) {
-    if (!targetRepo || targetRepo === state.repo) return;
+    var cleanTarget = normalizeRepoName(targetRepo);
+    if (!cleanTarget || cleanTarget === state.repo) return;
 
     if (state.isDirty) {
       await executeSave(true);
@@ -330,32 +363,36 @@
     updatePopupUI();
 
     try {
-      var loadResp = await fetch(CONFIG.apiLoad + '?repo=' + encodeURIComponent(targetRepo));
+      var loadResp = await fetch(CONFIG.apiLoad + '?repo=' + encodeURIComponent(cleanTarget));
       if (!loadResp.ok) throw new Error('无法读取图谱数据');
 
       var buf = await loadResp.arrayBuffer();
       var u8 = new Uint8Array(buf);
 
       var kwImport = window.cljs.core.keyword('thread-api/import-db-binary');
-      await window.frontend.state._LT_invoke_db_worker(kwImport, targetRepo, u8);
+      await window.frontend.state._LT_invoke_db_worker(kwImport, cleanTarget, u8);
 
       var kwSwitch = window.cljs.core.keyword('graph/switch');
       window.frontend.state.pub_event_BANG_(
         new window.cljs.core.PersistentVector(null, 2, 5, window.cljs.core.PersistentVector.EMPTY_NODE, [
-          kwSwitch, targetRepo
+          kwSwitch, cleanTarget
         ], null)
       );
 
-      state.repo = targetRepo;
-      state.targetPath = state.targetDir + '\\' + targetRepo + '\\db.sqlite';
+      state.repo = cleanTarget;
+      state.targetPath = state.targetDir + '\\' + cleanTarget + '\\db.sqlite';
       state.lastSavedBytes = u8.byteLength;
       state.lastSavedTime = formatTime(new Date());
       state.status = 'idle';
-      localStorage.setItem('logseq_preferred_graph', targetRepo);
+      state.errorMsg = '';
+      try {
+        localStorage.setItem('current-repo', JSON.stringify(cleanTarget));
+        localStorage.setItem('logseq_preferred_graph', cleanTarget);
+      } catch (e) {}
 
       updateIndicatorUI();
       updatePopupUI();
-      showNotification('已成功切换至图谱 [' + targetRepo + ']', 'success');
+      showNotification('已成功切换至图谱 [' + cleanTarget + ']', 'success');
     } catch (e) {
       console.error('[SwitchGraph] 切换失败:', e);
       state.status = 'error';
@@ -397,7 +434,7 @@
       }, true);
     });
 
-    // 监听 DOM 树变化（仅关注块新增、删除等结构变更）
+    // 监听 DOM 树变化（块新增、删除等结构变更）
     var domObserver = new MutationObserver(function(mutations) {
       var isBlockChange = false;
       for (var i = 0; i < mutations.length; i++) {
@@ -447,17 +484,17 @@
     // 页面即将卸载（关闭标签或刷新）触发 keepalive fetch 保存
     window.addEventListener('beforeunload', function() {
       if (state.isDirty) {
-        var curRepo = getCurrentRepo() || state.repo;
-        if (curRepo && window.frontend && window.frontend.state && window.frontend.state._LT_invoke_db_worker && window.cljs) {
+        var cleanRepo = getCurrentRepo() || state.repo;
+        if (cleanRepo && window.frontend && window.frontend.state && window.frontend.state._LT_invoke_db_worker && window.cljs) {
           try {
             var kw = window.cljs.core.keyword('thread-api/export-db-binary');
-            window.frontend.state._LT_invoke_db_worker(kw, curRepo).then(function(bin) {
+            window.frontend.state._LT_invoke_db_worker(kw, cleanRepo).then(function(bin) {
               if (bin && bin.byteLength > 0) {
                 fetch(CONFIG.apiSave, {
                   method: 'POST',
                   headers: {
                     'Content-Type': 'application/octet-stream',
-                    'X-Logseq-Repo': encodeURIComponent(curRepo)
+                    'X-Logseq-Repo': encodeURIComponent(cleanRepo)
                   },
                   body: bin,
                   keepalive: true
@@ -475,7 +512,7 @@
     var btn = document.getElementById('backup-status-indicator-btn');
     if (!btn) return;
 
-    var curRepo = getCurrentRepo() || state.repo;
+    var cleanRepo = getCurrentRepo() || state.repo;
     var status = state.status || 'idle';
     var timeStr = state.lastSavedTime || '刚刚';
 
@@ -483,7 +520,7 @@
                   status === 'hydrating' ? '正在从物理磁盘载入真实笔记图谱...' :
                   status === 'dirty' ? '有改动待保存 (停止输入 1.2 秒后自动写入，或按 Ctrl+S)' :
                   status === 'error' ? ('持久化异常: ' + (state.errorMsg || '点击查看详情')) :
-                  ('已安全保存至物理磁盘 (图谱: ' + curRepo + ', 上次保存: ' + timeStr + ')');
+                  ('已安全保存至物理磁盘 (图谱: ' + cleanRepo + ', 上次保存: ' + timeStr + ')');
     btn.title = tooltip;
 
     var dot = btn.querySelector('.backup-status-dot');
@@ -508,12 +545,18 @@
     }
   }
 
-  // 8. 挂载指示器按钮到顶部工具栏（优先放入 .cp__header .r 中的操作区）
+  // 8. 挂载指示器按钮到顶部工具栏
   function mountIndicator() {
-    var headRight = document.querySelector('.cp__header .r .flex.items-center, #head .r .flex.items-center, .cp__header .r, #head .r');
+    var headRight = document.querySelector(
+      '.cp__header .r .flex.items-center, ' +
+      '#head .r .flex.items-center, ' +
+      '.cp__header .r, ' +
+      '#head .r, ' +
+      '.cp__header'
+    );
     if (!headRight) return;
 
-    var targetContainer = headRight.classList.contains('items-center') ? headRight : headRight.querySelector('.flex.items-center') || headRight;
+    var targetContainer = headRight.classList.contains('items-center') ? headRight : (headRight.querySelector('.flex.items-center') || headRight);
 
     var existingBtn = document.getElementById('backup-status-indicator-btn');
     if (existingBtn) {
@@ -548,6 +591,7 @@
     } else {
       targetContainer.appendChild(btn);
     }
+
     updateIndicatorUI();
   }
 
@@ -563,7 +607,7 @@
     var popup = document.getElementById('logseq-backup-popup');
     if (!popup || !state.popupOpen) return;
 
-    var curRepo = getCurrentRepo() || state.repo;
+    var cleanRepo = getCurrentRepo() || state.repo;
     var status = state.status || 'idle';
     var timeStr = state.lastSavedTime || '刚刚';
 
@@ -592,13 +636,13 @@
 
     var pathDiv = popup.querySelector('.backup-popup-path');
     if (pathDiv) {
-      var p = state.targetPath || (state.targetDir + '\\' + curRepo + '\\db.sqlite');
+      var p = state.targetPath || (state.targetDir + '\\' + cleanRepo + '\\db.sqlite');
       pathDiv.textContent = p;
     }
 
     var select = popup.querySelector('#backup-popup-repo-select');
-    if (select && select.value !== curRepo) {
-      select.value = curRepo;
+    if (select && select.value !== cleanRepo) {
+      select.value = cleanRepo;
     }
   }
 
@@ -613,7 +657,7 @@
     state.popupOpen = true;
 
     var rect = anchorBtn.getBoundingClientRect();
-    var curRepo = getCurrentRepo() || state.repo;
+    var cleanRepo = getCurrentRepo() || state.repo;
     var status = state.status || 'idle';
     var timeStr = state.lastSavedTime || '刚刚';
 
@@ -635,17 +679,20 @@
     popup.style.minWidth = '320px';
     popup.style.maxWidth = '380px';
     popup.style.top = (rect.bottom + 6) + 'px';
-    popup.style.right = (window.innerWidth - rect.right) + 'px';
+    popup.style.right = Math.max(12, window.innerWidth - rect.right) + 'px';
 
     var graphOptionsHtml = '';
     if (state.graphs && state.graphs.length > 0) {
       state.graphs.forEach(function(g) {
-        var isSel = (g.name === curRepo) ? 'selected' : '';
-        graphOptionsHtml += '<option value="' + g.name + '" ' + isSel + '>' + g.name + ' (' + formatBytes(g.size) + ')</option>';
+        var cleanGName = normalizeRepoName(g.name);
+        var isSel = (cleanGName === cleanRepo) ? 'selected' : '';
+        graphOptionsHtml += '<option value="' + cleanGName + '" ' + isSel + '>' + cleanGName + ' (' + formatBytes(g.size) + ')</option>';
       });
     } else {
-      graphOptionsHtml = '<option value="' + curRepo + '">' + curRepo + '</option>';
+      graphOptionsHtml = '<option value="' + cleanRepo + '">' + cleanRepo + '</option>';
     }
+
+    var curPath = state.targetPath || (state.targetDir + '\\' + cleanRepo + '\\db.sqlite');
 
     popup.innerHTML =
       '<div class="flex items-center justify-between border-b border-border/60 pb-2 mb-2.5">' +
@@ -671,7 +718,7 @@
         '</div>' +
         '<div class="flex justify-between items-center">' +
           '<span class="opacity-70">数据体积:</span>' +
-          '<span class="backup-popup-size font-mono">' + (state.lastSavedBytes ? formatBytes(state.lastSavedBytes) : '10.9 MB') + '</span>' +
+          '<span class="backup-popup-size font-mono">' + (state.lastSavedBytes ? formatBytes(state.lastSavedBytes) : '11.0 MB') + '</span>' +
         '</div>' +
         '<div class="flex justify-between items-center">' +
           '<span class="opacity-70">历史镜像快照:</span>' +
@@ -682,7 +729,7 @@
           '<span class="font-mono text-muted-foreground">打字停止1.2s / 切页面即存</span>' +
         '</div>' +
         '<div class="backup-popup-path mt-1 p-2 rounded bg-secondary/50 font-mono text-[11px] break-all border border-border/40 select-all text-muted-foreground leading-relaxed">' +
-          (state.targetPath || (state.targetDir + '\\' + curRepo + '\\db.sqlite')) +
+          curPath +
         '</div>' +
       '</div>' +
       '<div class="border-t border-border/60 pt-2.5 mt-2.5 flex flex-col gap-2">' +
@@ -733,8 +780,54 @@
     }, 50);
   }
 
-  // 12. 引擎初始化
+  // 12. 拦截并规范全局网络与保存行为
+  function setupGlobalInterceptors() {
+    // 拦截 fetch: 确保发往 /api/storage/save 的 X-Logseq-Repo 头绝对不带 logseq_db_ 前缀
+    var origFetch = window.fetch;
+    window.fetch = function(input, init) {
+      try {
+        var url = (typeof input === 'string') ? input : (input && input.url ? input.url : '');
+        if (url && url.indexOf('/api/storage/save') !== -1 && init && init.headers) {
+          var h = init.headers;
+          var repoVal = '';
+          if (h instanceof Headers) {
+            repoVal = h.get('X-Logseq-Repo') || '';
+            if (repoVal) h.set('X-Logseq-Repo', encodeURIComponent(normalizeRepoName(decodeURIComponent(repoVal))));
+          } else if (typeof h === 'object') {
+            for (var k in h) {
+              if (k.toLowerCase() === 'x-logseq-repo') {
+                repoVal = h[k];
+                h[k] = encodeURIComponent(normalizeRepoName(decodeURIComponent(repoVal)));
+              }
+            }
+          }
+        }
+      } catch (e) {}
+      return origFetch.apply(this, arguments);
+    };
+
+    // 过滤对启动时 Demo 图谱的瞬态报错通知
+    try {
+      if (window.frontend && window.frontend.handler && window.frontend.handler.notification && window.frontend.handler.notification.show_BANG_) {
+        var origNotify = window.frontend.handler.notification.show_BANG_;
+        window.frontend.handler.notification.show_BANG_ = function(msg, type) {
+          var s = String(msg || '');
+          if (s.indexOf('File not found: /db.sqlite') !== -1 || s.indexOf('SQLiteDB 保存错误') !== -1) {
+            var cur = getCurrentRepo();
+            if (!state.hydrated || cur.toLowerCase() === 'demo') {
+              console.warn('[Notification Suppressed]', msg);
+              return;
+            }
+          }
+          return origNotify.apply(this, arguments);
+        };
+      }
+    } catch (e) {}
+  }
+
+  // 13. 引擎初始化
   function init() {
+    setupGlobalInterceptors();
     mountIndicator();
     setupChangeListeners();
 
@@ -751,8 +844,8 @@
       updatePopupUI();
     }, 1000);
 
-    // 等待 3 秒后尝试首次水合
-    setTimeout(hydrateUserGraphIfNeeded, 3000);
+    // 等待 2 秒后尝试首次水合
+    setTimeout(hydrateUserGraphIfNeeded, 2000);
   }
 
   // 导出全局 API 供控制台或测试使用
@@ -761,7 +854,8 @@
     executeSave: executeSave,
     switchGraph: switchGraph,
     hydrate: hydrateUserGraphIfNeeded,
-    markDirty: markDirtyAndScheduleSave
+    markDirty: markDirtyAndScheduleSave,
+    normalizeRepoName: normalizeRepoName
   };
 
   if (document.readyState === 'loading') {

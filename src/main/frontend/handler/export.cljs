@@ -134,7 +134,7 @@
   (-> (js/fetch "/api/storage/save"
                 #js {:method "POST"
                      :headers #js {"Content-Type" "application/octet-stream"
-                                   "X-Logseq-Repo" (js/encodeURIComponent (str repo))}
+                                   "X-Logseq-Repo" (js/encodeURIComponent (clojure.string.replace (str (or repo "高三")) #"^logseq_db_" ""))}
                      :body data})
       (p/then (fn [res]
                 (if (.-ok res)
@@ -426,7 +426,7 @@
                               (p/catch
                                (p/let [[_ handle] (<resolve-backup-handle repo folder-name {:interactive? interactive?})]
                                  (if handle
-                                   (let [repo-name (common-sqlite/sanitize-db-name repo)]
+                                   (let [repo-name (clojure.string.replace (common-sqlite/sanitize-db-name (or repo "高三")) #"^logseq_db_" "")]
                                      (p/let [graph-dir-handle (.getDirectoryHandle handle repo-name #js {:create true})
                                              backups-handle (.getDirectoryHandle graph-dir-handle "backups" #js {:create true})
                                              backup-handle ^js (.getFileHandle graph-dir-handle "db.sqlite" #js {:create true})

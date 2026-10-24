@@ -1,5 +1,27 @@
 # Logseq GitHub 同步记录 (GitHub Sync Log)
 
+## [v0.0.8] - 2026-10-24 22:17:46
+
+- **同步目标**: GitHub 仓库 `tokewer/logseq`
+- **同步分支**: `master` & `gh-pages`
+- **提交说明**: fix: 彻底消除 logseq_db_ 前缀与文件夹命名不符问题，重构自动直存与水合引擎
+- **变更文件清单**:
+  - `M GITHUB_SYNC_LOG.md`
+  - `M data/storage_config.json`
+  - `M server.py`
+  - `M src/main/frontend/components/header.cljs`
+  - `M src/main/frontend/components/settings.cljs`
+  - `M src/main/frontend/handler/export.cljs`
+  - `M static/js/backup-indicator.js`
+  - `?? scripts/inspect_dom.mjs`
+  - `?? scripts/patch_sources.py`
+  - `?? scripts/reproduce_issue.mjs`
+  - `?? scripts/test_preseed.mjs`
+  - `?? scripts/test_v230_end_to_end.mjs`
+- **同步状态**: ✅ 已成功同步至 GitHub 仓库与静态托管站点 (https://tokewer.github.io/logseq/)
+
+---
+
 ## [v0.0.7] - 2026-10-22 22:54:51
 
 - **同步目标**: GitHub 仓库 `tokewer/logseq`
@@ -101,3 +123,9 @@
 - [2026-10-22 22:49:13] 自动保存便签数据: 图谱=`高三—`, 大小=`10936320` 字节, 路径=`F:\新学习资料分站\数据\随笔便签\高三—\db.sqlite`
 - [2026-10-22 22:50:32] 自动保存便签数据: 图谱=`高三—`, 大小=`10936320` 字节, 路径=`F:\新学习资料分站\数据\随笔便签\高三—\db.sqlite`
 - [2026-10-22 22:53:12] 自动保存便签数据: 图谱=`高三—`, 大小=`10936320` 字节, 路径=`F:\新学习资料分站\数据\随笔便签\高三—\db.sqlite`
+- [2026-10-24 21:59:12] 自动保存便签数据: 图谱=`高三—`, 大小=`10936320` 字节, 路径=`F:\新学习资料分站\数据\随笔便签\高三—\db.sqlite`
+- [2026-10-24 22:02:48] 自动保存便签数据: 图谱=`高三—`, 大小=`10936320` 字节, 路径=`F:\新学习资料分站\数据\随笔便签\高三—\db.sqlite`
+- [2026-10-24 22:07:41] 自动保存便签数据: 图谱=`高三—`, 大小=`10936320` 字节, 路径=`F:\新学习资料分站\数据\随笔便签\高三—\db.sqlite`
+- [2026-10-24 22:09:54] 自动保存便签数据: 图谱=`logseq_db_Demo`, 大小=`409600` 字节, 路径=`F:\新学习资料分站\数据\随笔便签\logseq_db_Demo\db.sqlite`
+- [2026-10-24 22:16:54] 自动保存便签数据: 图谱=`高三`, 大小=`11091968` 字节, 路径=`F:\新学习资料分站\数据\随笔便签\高三\db.sqlite`
+- [2026-10-24 22:17:00] 自动保存便签数据: 图谱=`高三`, 大小=`11091968` 字节, 路径=`F:\新学习资料分站\数据\随笔便签\高三\db.sqlite`
