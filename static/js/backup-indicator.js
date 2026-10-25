@@ -1,18 +1,22 @@
 /**
- * Logseq Web Native Auto-Save & Disk Storage Engine (v2.3.0)
+ * Logseq Web Native Auto-Save & Disk Storage Engine (v2.4.0)
  * 
  * 核心升级与修复：
- * 1. 彻底消除 logseq_db_ 内部前缀，图谱名称与物理文件夹名称 100% 保持纯净（高三）。
- * 2. 严格杜绝文件夹嵌套：保存文件夹严格解析至选定目录，绝不生成 高三\高三 或 高三—\高三。
- * 3. 增强双候选 Worker 导出通道，解决图谱切换瞬态的 "File not found: /db.sqlite" 假死问题。
- * 4. 自动水合物理磁盘最新真实数据，并在编辑停顿 1.2 秒后自动写入本地物理磁盘 db.sqlite。
- * 5. 自动保留最近 10 份历史备份快照于 backups/，写入 GITHUB_SYNC_LOG.md 审计日志。
- * 6. 原生精致 UI：状态指示灯（🟢已保存 / 🟡待保存 / 🔵写入中 / 🔴异常）与控制弹窗。
+ * 1. 弹出框精确定位：严格约束在视口内（Clamp [12px, window.innerWidth - popupWidth - 12px]），
+ *    挂载于顶部右上角工具栏（.toolbar-dots-btn 左侧），彻底解决弹出框显示在屏幕以外的问题。
+ * 2. 持久化异常自动自愈：
+ *    - 增加 2 秒心跳检测与断线自动重连，服务端恢复后自动清除异常标记。
+ *    - 增强 Worker 导出 3 次重试与双候选通道，彻底消除数据库就绪间隙的误报错。
+ *    - 移除对 ClojureScript 原生多元函数的不兼容拦截，彻底杜绝 TypeError。
+ * 3. 彻底消除 logseq_db_ 内部前缀，图谱名称与物理文件夹名称 100% 保持纯净（高三）。
+ * 4. 严格杜绝文件夹嵌套：保存文件夹严格解析至选定目录，绝不生成 高三\高三 或 高三—\高三。
+ * 5. 编辑停止 1.2 秒自动原子写入本地物理磁盘 db.sqlite，并保留 10 份历史备份快照于 backups/。
  */
 (function() {
   'use strict';
 
   var CONFIG = {
+    apiPing: '/api/ping',
     apiGraphs: '/api/storage/graphs',
     apiLoad: '/api/storage/load',
     apiSave: '/api/storage/save',
@@ -20,7 +24,7 @@
     apiGitSync: '/api/sync/github',
     defaultTargetDir: 'F:\\新学习资料分站\\数据\\随笔便签',
     debounceDelayMs: 1200,
-    heartbeatIntervalMs: 2000
+    heartbeatIntervalMs: 2500
   };
 
   // 规范化图谱名称：去除 logseq_db_ 前缀与非法字符
@@ -48,7 +52,8 @@
     lastSavedBytes: 0,
     saveInFlight: false,
     hasPendingSaveAfterFlight: false,
-    hydrated: false
+    hydrated: false,
+    serverOnline: true
   };
 
   var isHydrating = false;
@@ -186,7 +191,7 @@
     }
   }
 
-  // 2. 核心持久化执行函数（双通道候选提取 worker 二进制并原子写入本地磁盘）
+  // 2. 核心持久化执行函数（多重候选 + 3 次重试导出 worker 二进制并原子写入本地磁盘）
   async function executeSave(force) {
     if (state.saveInFlight) {
       state.hasPendingSaveAfterFlight = true;
@@ -237,27 +242,20 @@
         }
       }
 
-      for (var i = 0; i < candidates.length; i++) {
-        try {
-          var res = await window.frontend.state._LT_invoke_db_worker(kwExport, candidates[i]);
-          if (res && res.byteLength > 0) {
-            dbBinary = res;
-            break;
-          }
-        } catch (candidateErr) {}
-      }
-
-      // 若处于图谱切换间隙，短暂重试一次
-      if (!dbBinary || dbBinary.byteLength === 0) {
-        await new Promise(function(resolve) { setTimeout(resolve, 250); });
-        for (var j = 0; j < candidates.length; j++) {
+      // 3 次容错重试提取（防止图谱切换过渡间隙抛出 File not found）
+      for (var attempt = 1; attempt <= 3; attempt++) {
+        for (var i = 0; i < candidates.length; i++) {
           try {
-            var retryRes = await window.frontend.state._LT_invoke_db_worker(kwExport, candidates[j]);
-            if (retryRes && retryRes.byteLength > 0) {
-              dbBinary = retryRes;
+            var res = await window.frontend.state._LT_invoke_db_worker(kwExport, candidates[i]);
+            if (res && res.byteLength > 0) {
+              dbBinary = res;
               break;
             }
-          } catch (retryErr) {}
+          } catch (candidateErr) {}
+        }
+        if (dbBinary && dbBinary.byteLength > 0) break;
+        if (attempt < 3) {
+          await new Promise(function(resolve) { setTimeout(resolve, 250); });
         }
       }
 
@@ -265,14 +263,19 @@
         throw new Error('导出的数据库二进制数据为空');
       }
 
-      var resp = await fetch(CONFIG.apiSave, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/octet-stream',
-          'X-Logseq-Repo': encodeURIComponent(cleanRepo)
-        },
-        body: dbBinary
-      });
+      var resp = null;
+      try {
+        resp = await fetch(CONFIG.apiSave, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/octet-stream',
+            'X-Logseq-Repo': encodeURIComponent(cleanRepo)
+          },
+          body: dbBinary
+        });
+      } catch (netErr) {
+        throw new Error('本地存储服务未连接 (请确保运行了启动脚本并保持服务开启)');
+      }
 
       if (!resp.ok) {
         var errText = await resp.text();
@@ -291,6 +294,7 @@
       state.isDirty = false;
       state.status = 'idle';
       state.errorMsg = '';
+      state.serverOnline = true;
 
       console.log('[AutoSave] 成功自动持久化 [' + cleanRepo + '] 至物理磁盘: ' + state.targetPath + ' (' + dbBinary.byteLength + ' 字节)');
     } catch (e) {
@@ -316,7 +320,7 @@
     if (state.status === 'hydrating' || state.saveInFlight) return;
 
     state.isDirty = true;
-    if (state.status !== 'saving') {
+    if (state.status !== 'saving' && state.status !== 'error') {
       state.status = 'dirty';
       updateIndicatorUI();
       updatePopupUI();
@@ -422,7 +426,35 @@
     }
   }
 
-  // 6. 全局事件监听（捕获一切键盘打字、粘贴、剪切、中文输入法）
+  // 6. 服务健康自愈检查（心跳探测）
+  async function checkServerHealth() {
+    try {
+      var res = await fetch(CONFIG.apiPing);
+      if (res.ok) {
+        state.serverOnline = true;
+        // 若先前由于网络断连而报持久化异常，自动恢复并重试一次保存
+        if (state.status === 'error' && state.errorMsg && state.errorMsg.includes('服务未连接')) {
+          state.status = 'idle';
+          state.errorMsg = '';
+          updateIndicatorUI();
+          updatePopupUI();
+          if (state.isDirty) {
+            executeSave(false);
+          }
+        }
+      }
+    } catch (e) {
+      state.serverOnline = false;
+      if (state.status === 'idle') {
+        state.status = 'error';
+        state.errorMsg = '本地存储服务未连接 (请确保运行了启动脚本)';
+        updateIndicatorUI();
+        updatePopupUI();
+      }
+    }
+  }
+
+  // 7. 全局事件监听（捕获一切键盘打字、粘贴、剪切、中文输入法）
   function setupChangeListeners() {
     var events = ['input', 'compositionend', 'keyup', 'paste', 'cut', 'change'];
     events.forEach(function(evtName) {
@@ -507,7 +539,7 @@
     });
   }
 
-  // 7. 更新顶部栏指示器图标与徽标状态
+  // 8. 更新顶部栏指示器图标与徽标状态
   function updateIndicatorUI() {
     var btn = document.getElementById('backup-status-indicator-btn');
     if (!btn) return;
@@ -545,22 +577,20 @@
     }
   }
 
-  // 8. 挂载指示器按钮到顶部工具栏
+  // 9. 精确挂载指示器按钮到顶部右上角工具栏（位于三点菜单按钮左侧）
   function mountIndicator() {
-    var headRight = document.querySelector(
-      '.cp__header .r .flex.items-center, ' +
-      '#head .r .flex.items-center, ' +
-      '.cp__header .r, ' +
-      '#head .r, ' +
-      '.cp__header'
+    // 严格定位到顶部右侧操作按钮区，坚决不挂在左侧菜单
+    var rightContainer = document.querySelector(
+      '#head .r > .flex.items-center, ' +
+      '.cp__header .r > .flex.items-center, ' +
+      '#head .r .flex.items-center:last-child, ' +
+      '.cp__header .r .flex.items-center:last-child'
     );
-    if (!headRight) return;
-
-    var targetContainer = headRight.classList.contains('items-center') ? headRight : (headRight.querySelector('.flex.items-center') || headRight);
+    if (!rightContainer) return;
 
     var existingBtn = document.getElementById('backup-status-indicator-btn');
     if (existingBtn) {
-      if (existingBtn.parentNode === targetContainer) return;
+      if (existingBtn.parentNode === rightContainer) return;
       existingBtn.remove();
     }
 
@@ -586,23 +616,27 @@
       togglePopup(btn);
     });
 
-    if (targetContainer.firstChild) {
-      targetContainer.insertBefore(btn, targetContainer.firstChild);
+    // 优先插入到三点菜单 (.toolbar-dots-btn) 或侧边栏切换按钮前
+    var dotsBtn = rightContainer.querySelector('.toolbar-dots-btn, .toggle-right-sidebar');
+    if (dotsBtn) {
+      rightContainer.insertBefore(btn, dotsBtn);
+    } else if (rightContainer.firstChild) {
+      rightContainer.insertBefore(btn, rightContainer.firstChild);
     } else {
-      targetContainer.appendChild(btn);
+      rightContainer.appendChild(btn);
     }
 
     updateIndicatorUI();
   }
 
-  // 9. 关闭弹窗
+  // 10. 关闭弹窗
   function closePopup() {
     var popup = document.getElementById('logseq-backup-popup');
     if (popup) popup.remove();
     state.popupOpen = false;
   }
 
-  // 10. 更新弹窗内元素显示
+  // 11. 更新弹窗内元素显示
   function updatePopupUI() {
     var popup = document.getElementById('logseq-backup-popup');
     if (!popup || !state.popupOpen) return;
@@ -644,9 +678,20 @@
     if (select && select.value !== cleanRepo) {
       select.value = cleanRepo;
     }
+
+    // 异常信息提醒
+    var errBox = popup.querySelector('.backup-popup-error');
+    if (errBox) {
+      if (status === 'error' && state.errorMsg) {
+        errBox.textContent = '⚠️ ' + state.errorMsg;
+        errBox.style.display = 'block';
+      } else {
+        errBox.style.display = 'none';
+      }
+    }
   }
 
-  // 11. 打开详情与控制弹窗
+  // 12. 打开详情与控制弹窗（严格视口保护与边界强力钳位）
   function togglePopup(anchorBtn) {
     if (state.popupOpen) {
       closePopup();
@@ -675,11 +720,32 @@
     var popup = document.createElement('div');
     popup.id = 'logseq-backup-popup';
     popup.setAttribute('role', 'dialog');
-    popup.className = 'fixed z-50 rounded-lg border border-border bg-popover text-popover-foreground shadow-2xl p-3.5 text-sm select-none animate-in fade-in-0 zoom-in-95';
-    popup.style.minWidth = '320px';
-    popup.style.maxWidth = '380px';
-    popup.style.top = (rect.bottom + 6) + 'px';
-    popup.style.right = Math.max(12, window.innerWidth - rect.right) + 'px';
+    popup.className = 'fixed z-[9999] rounded-lg border border-border bg-popover text-popover-foreground shadow-2xl p-3.5 text-sm select-none animate-in fade-in-0 zoom-in-95';
+    
+    // 强制视口边界计算：严禁超出屏幕哪怕 1 像素
+    var popupWidth = 340;
+    var top = rect.bottom + 6;
+    if (top + 330 > window.innerHeight) {
+      top = Math.max(10, rect.top - 336);
+    }
+
+    // 智能水平对齐与强力钳位
+    var left;
+    if (rect.right > window.innerWidth / 2) {
+      left = rect.right - popupWidth;
+    } else {
+      left = rect.left;
+    }
+    var minLeft = 12;
+    var maxLeft = window.innerWidth - popupWidth - 12;
+    if (maxLeft < minLeft) maxLeft = minLeft;
+    left = Math.max(minLeft, Math.min(left, maxLeft));
+
+    popup.style.width = popupWidth + 'px';
+    popup.style.maxWidth = 'calc(100vw - 24px)';
+    popup.style.top = top + 'px';
+    popup.style.left = left + 'px';
+    popup.style.right = 'auto';
 
     var graphOptionsHtml = '';
     if (state.graphs && state.graphs.length > 0) {
@@ -693,6 +759,9 @@
     }
 
     var curPath = state.targetPath || (state.targetDir + '\\' + cleanRepo + '\\db.sqlite');
+    var errorBoxHtml = (status === 'error' && state.errorMsg)
+      ? '<div class="backup-popup-error text-xs text-red-500 bg-red-50 dark:bg-red-950/40 p-2 rounded border border-red-200 dark:border-red-800 break-all leading-normal">⚠️ ' + state.errorMsg + '</div>'
+      : '<div class="backup-popup-error text-xs text-red-500 bg-red-50 dark:bg-red-950/40 p-2 rounded border border-red-200 dark:border-red-800 break-all leading-normal" style="display:none"></div>';
 
     popup.innerHTML =
       '<div class="flex items-center justify-between border-b border-border/60 pb-2 mb-2.5">' +
@@ -701,6 +770,7 @@
         '</div>' +
         '<span class="backup-popup-badge text-xs px-2 py-0.5 rounded-full font-medium ' + badgeClass + '">' + badgeText + '</span>' +
       '</div>' +
+      errorBoxHtml +
       '<div class="flex flex-col gap-2 text-xs text-foreground/85 py-0.5">' +
         '<div class="flex justify-between items-center">' +
           '<span class="opacity-70">存储模式:</span>' +
@@ -780,9 +850,8 @@
     }, 50);
   }
 
-  // 12. 拦截并规范全局网络与保存行为
+  // 13. 拦截并规范全局网络请求（确保 X-Logseq-Repo 头绝对不带 logseq_db_ 前缀）
   function setupGlobalInterceptors() {
-    // 拦截 fetch: 确保发往 /api/storage/save 的 X-Logseq-Repo 头绝对不带 logseq_db_ 前缀
     var origFetch = window.fetch;
     window.fetch = function(input, init) {
       try {
@@ -805,27 +874,9 @@
       } catch (e) {}
       return origFetch.apply(this, arguments);
     };
-
-    // 过滤对启动时 Demo 图谱的瞬态报错通知
-    try {
-      if (window.frontend && window.frontend.handler && window.frontend.handler.notification && window.frontend.handler.notification.show_BANG_) {
-        var origNotify = window.frontend.handler.notification.show_BANG_;
-        window.frontend.handler.notification.show_BANG_ = function(msg, type) {
-          var s = String(msg || '');
-          if (s.indexOf('File not found: /db.sqlite') !== -1 || s.indexOf('SQLiteDB 保存错误') !== -1) {
-            var cur = getCurrentRepo();
-            if (!state.hydrated || cur.toLowerCase() === 'demo') {
-              console.warn('[Notification Suppressed]', msg);
-              return;
-            }
-          }
-          return origNotify.apply(this, arguments);
-        };
-      }
-    } catch (e) {}
   }
 
-  // 13. 引擎初始化
+  // 14. 引擎初始化
   function init() {
     setupGlobalInterceptors();
     mountIndicator();
@@ -844,8 +895,14 @@
       updatePopupUI();
     }, 1000);
 
-    // 等待 2 秒后尝试首次水合
-    setTimeout(hydrateUserGraphIfNeeded, 2000);
+    // 服务心跳与断线自愈检查
+    setInterval(checkServerHealth, CONFIG.heartbeatIntervalMs);
+
+    // 等待 2 秒后尝试首次水合与心跳检查
+    setTimeout(function() {
+      checkServerHealth();
+      hydrateUserGraphIfNeeded();
+    }, 2000);
   }
 
   // 导出全局 API 供控制台或测试使用
@@ -855,7 +912,8 @@
     switchGraph: switchGraph,
     hydrate: hydrateUserGraphIfNeeded,
     markDirty: markDirtyAndScheduleSave,
-    normalizeRepoName: normalizeRepoName
+    normalizeRepoName: normalizeRepoName,
+    mountIndicator: mountIndicator
   };
 
   if (document.readyState === 'loading') {
